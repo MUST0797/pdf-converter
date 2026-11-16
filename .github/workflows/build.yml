@@ -27,6 +27,24 @@ jobs:
       - name: Remove default test
         run: rm -rf test
 
+      - name: Force compileSdk 36
+        run: |
+          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/' android/app/build.gradle.kts
+          cat > /tmp/patch.kts <<'EOF'
+          subprojects {
+              if (name != "app") {
+                  afterEvaluate {
+                      extensions.findByName("android")?.let { ext ->
+                          ext.javaClass.getMethod("compileSdkVersion", Int::class.javaPrimitiveType).invoke(ext, 36)
+                      }
+                  }
+              }
+          }
+
+          EOF
+          cat /tmp/patch.kts android/build.gradle.kts > /tmp/new.kts
+          mv /tmp/new.kts android/build.gradle.kts
+
       - run: flutter pub get
 
       - name: Build release APK
