@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -49,6 +50,7 @@ Future<File> imagesToPdf(List<String> paths) async {
   for (final p in paths) {
     var bytes = await File(p).readAsBytes();
     final ext = p.toLowerCase().split('.').last;
+    // pdf package supports jpg/png only; convert others (webp etc.) to png
     if (ext != 'jpg' && ext != 'jpeg' && ext != 'png') {
       bytes = await toPngBytes(bytes);
     }
@@ -70,6 +72,27 @@ Future<File> imagesToPdf(List<String> paths) async {
   return file;
 }
 
+Future<File> textToPdf(String text, String baseName) async {
+  final doc = pw.Document();
+  final lines = text.replaceAll('\r\n', '\n').split('\n');
+  doc.addPage(
+    pw.MultiPage(
+      pageFormat: PdfPageFormat.a4,
+      margin: const pw.EdgeInsets.all(32),
+      maxPages: 2000,
+      build: (_) => lines
+          .map((l) => pw.Text(l.isEmpty ? ' ' : l,
+              style: const pw.TextStyle(fontSize: 12)))
+          .toList(),
+    ),
+  );
+  final dir = await pdfDir();
+  final file = File(
+      '${dir.path}/${baseName}_${DateTime.now().millisecondsSinceEpoch}.pdf');
+  await file.writeAsBytes(await doc.save());
+  return file;
+}
+
 void snack(BuildContext c, String msg) {
   ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(msg)));
 }
@@ -84,7 +107,8 @@ class HomeScreen extends StatelessWidget {
     final items = <_Tool>[
       _Tool('Image → PDF', Icons.image, true,
           () => _go(context, const ImageToPdfScreen())),
-      _Tool('TXT → PDF', Icons.text_snippet, false, null),
+      _Tool('TXT → PDF', Icons.text_snippet, true,
+          () => _go(context, const TxtToPdfScreen())),
       _Tool('DOCX → PDF', Icons.description, false, null),
       _Tool('PDF → DOCX', Icons.picture_as_pdf, false, null),
     ];
@@ -257,6 +281,114 @@ class _ImageToPdfScreenState extends State<ImageToPdfScreen> {
   }
 }
 
+// ---------- TXT -> PDF ----------
+
+class TxtToPdfScreen extends StatefulWidget {
+  const TxtToPdfScreen({super.key});
+
+  @override
+  State<TxtToPdfScreen> createState() => _TxtToPdfScreenState();
+}
+
+class _TxtToPdfScreenState extends State<TxtToPdfScreen> {
+  String? _name;
+  String? _text;
+  bool _busy = false;
+
+  Future<void> _pick() async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['txt'],
+    );
+    if (res == null || res.files.single.path == null) return;
+    final path = res.files.single.path!;
+    final bytes = await File(path).readAsBytes();
+    setState(() {
+      _name = res.files.single.name;
+      _text = utf8.decode(bytes, allowMalformed: true);
+    });
+  }
+
+  Future<void> _convert() async {
+    setState(() => _busy = true);
+    try {
+      final base = _name!.replaceAll(RegExp(r'\.txt$', caseSensitive: false), '');
+      final file = await textToPdf(_text!, base);
+      if (!mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => ResultScreen(file: file)),
+      );
+    } catch (e) {
+      if (mounted) snack(context, 'Convert aagala: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = (_text ?? '');
+    return Scaffold(
+      appBar: AppBar(title: const Text('TXT → PDF')),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _busy ? null : _pick,
+        icon: const Icon(Icons.text_snippet),
+        label: const Text('Select TXT file'),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: _text == null
+                ? const Center(child: Text('TXT file select pannunga'))
+                : Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(_name!,
+                            style: const TextStyle(
+                                fontWeight: FontWeight.w600, fontSize: 16)),
+                        const SizedBox(height: 4),
+                        Text('${_text!.length} characters'),
+                        const Divider(height: 24),
+                        Expanded(
+                          child: SingleChildScrollView(
+                            child: Text(
+                              preview.length > 1500
+                                  ? '${preview.substring(0, 1500)}...'
+                                  : preview,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
+              child: SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: (_text == null || _busy) ? null : _convert,
+                  icon: _busy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.picture_as_pdf),
+                  label: Text(_busy ? 'Converting...' : 'Convert to PDF'),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 // ---------- Result ----------
 
 class ResultScreen extends StatelessWidget {
@@ -288,7 +420,8 @@ class ResultScreen extends StatelessWidget {
             SizedBox(
               width: double.infinity,
               child: OutlinedButton.icon(
-                onPressed: () => Share.shareXFiles([XFile(file.path)]),
+                onPressed: () =>
+                    Share.shareXFiles([XFile(file.path)]),
                 icon: const Icon(Icons.share),
                 label: const Text('Share'),
               ),
@@ -336,8 +469,7 @@ class _MyFilesScreenState extends State<MyFilesScreen> {
     final list = dir
         .listSync()
         .whereType<File>()
-        .where((f) =>
-            f.path.toLowerCase().endsWith('.pdf') ||
+        .where((f) => f.path.toLowerCase().endsWith('.pdf') ||
             f.path.toLowerCase().endsWith('.docx'))
         .toList()
       ..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
@@ -397,7 +529,8 @@ class _MyFilesScreenState extends State<MyFilesScreen> {
                         children: [
                           IconButton(
                             icon: const Icon(Icons.share),
-                            onPressed: () => Share.shareXFiles([XFile(f.path)]),
+                            onPressed: () =>
+                                Share.shareXFiles([XFile(f.path)]),
                           ),
                           IconButton(
                             icon: const Icon(Icons.delete_outline),
