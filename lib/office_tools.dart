@@ -581,4 +581,163 @@ Future<File> docxToPdf(String path, String name) async {
   final entry = archive.findFile('word/document.xml');
   if (entry == null) throw Exception('Idhu valid .docx file illa');
   final xml = XmlDocument.parse(
-      utf8.decode(entry.content as List
+      utf8.decode(entry.content as List<int>, allowMalformed: true));
+  final bodies = xml.findAllElements('w:body');
+  if (bodies.isEmpty) throw Exception('DOCX-la content kidaikkala');
+  final body = bodies.first;
+
+  // Page setup
+  final sect = body.getElement('w:sectPr');
+  final pgSz = sect?.getElement('w:pgSz');
+  final pgMar = sect?.getElement('w:pgMar');
+  double tw(XmlElement? e, String attr, double def) {
+    final v = double.tryParse(e?.getAttribute(attr) ?? '');
+    return v == null ? def : v / 20;
+  }
+
+  final pageW = tw(pgSz, 'w:w', 595.3);
+  final pageH = tw(pgSz, 'w:h', 841.9);
+  final mt = tw(pgMar, 'w:top', 72);
+  final mb = tw(pgMar, 'w:bottom', 72);
+  final ml = tw(pgMar, 'w:left', 72);
+  final mr = tw(pgMar, 'w:right', 72);
+  final hd = tw(pgMar, 'w:header', 36);
+  final fd = tw(pgMar, 'w:footer', 36);
+  final contentW = pageW - ml - mr;
+
+  final styles = _loadStyles(archive);
+
+  // Header / footer
+  final docRels = _loadRels(archive, 'word/document.xml');
+  String? refPath(String tag) {
+    final id = sect?.getElement(tag)?.getAttribute('r:id');
+    return id == null ? null : docRels[id];
+  }
+
+  final header =
+      _buildPart(archive, refPath('w:headerReference'), contentW, styles);
+  final footer =
+      _buildPart(archive, refPath('w:footerReference'), contentW, styles);
+  final hasHeader = header.widgets.isNotEmpty;
+  final hasFooter = footer.widgets.isNotEmpty;
+  final headerPad = math.max(0.0, (mt - hd) - header.height) + 4;
+
+  // Body
+  final ctx = _Ctx(archive, docRels, styles);
+  final widgets = <pw.Widget>[];
+  for (final el in body.children.whereType<XmlElement>()) {
+    final tag = el.name.qualified;
+    if (tag == 'w:p') {
+      widgets.add(_paragraph(el, ctx, contentW).widget);
+    } else if (tag == 'w:tbl') {
+      widgets.addAll(_docxTable(el, ctx, contentW));
+    }
+  }
+
+  final doc = pw.Document();
+  doc.addPage(
+    pw.MultiPage(
+      pageFormat: PdfPageFormat(pageW, pageH),
+      margin: pw.EdgeInsets.fromLTRB(
+          ml, hasHeader ? hd : mt, mr, hasFooter ? fd : mb),
+      maxPages: 2000,
+      header: hasHeader
+          ? (pw.Context c) => pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: [...header.widgets, pw.SizedBox(height: headerPad)],
+              )
+          : null,
+      footer: hasFooter
+          ? (pw.Context c) => pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: footer.widgets,
+              )
+          : null,
+      build: (_) => widgets.isEmpty ? [pw.Text(' ')] : widgets,
+    ),
+  );
+
+  final dir = await pdfDir();
+  final file = File(
+      '${dir.path}/${_baseName(name)}_${DateTime.now().millisecondsSinceEpoch}.pdf');
+  await file.writeAsBytes(await doc.save());
+  return file;
+}
+
+// ---------- PDF -> DOCX ----------
+
+String _xmlEsc(String s) => s
+    .replaceAll(RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]'), '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+
+Future<File> pdfToDocx(String path, String name) async {
+  final bytes = await File(path).readAsBytes();
+  final sfDoc = sf.PdfDocument(inputBytes: bytes);
+  final extractor = sf.PdfTextExtractor(sfDoc);
+
+  final pages = <List<String>>[];
+  var total = 0;
+  for (var i = 0; i < sfDoc.pages.count; i++) {
+    final t = extractor.extractText(startPageIndex: i, endPageIndex: i);
+    total += t.trim().length;
+    pages.add(
+      t.replaceAll('\r\n', '\n').split('\n').map((l) => l.trimRight()).toList(),
+    );
+  }
+  sfDoc.dispose();
+
+  if (total == 0) {
+    throw Exception(
+        'Idhu scanned (image) PDF. Text illa, v1-la support illa.');
+  }
+
+  final body = StringBuffer();
+  for (var i = 0; i < pages.length; i++) {
+    for (final line in pages[i]) {
+      body.write(
+          '<w:p><w:r><w:t xml:space="preserve">${_xmlEsc(line)}</w:t></w:r></w:p>');
+    }
+    if (i < pages.length - 1) {
+      body.write('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
+    }
+  }
+
+  const header = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  final docXml = '$header'
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+      '<w:body>$body'
+      '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+      '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" '
+      'w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>'
+      '</w:body></w:document>';
+
+  const contentTypes = '$header'
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+      '<Default Extension="xml" ContentType="application/xml"/>'
+      '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+      '</Types>';
+
+  const rels = '$header'
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+      '</Relationships>';
+
+  final out = Archive();
+  void add(String n, String content) {
+    final b = utf8.encode(content);
+    out.addFile(ArchiveFile(n, b.length, b));
+  }
+
+  add('[Content_Types].xml', contentTypes);
+  add('_rels/.rels', rels);
+  add('word/document.xml', docXml);
+
+  final dir = await pdfDir();
+  final file = File(
+      '${dir.path}/${_baseName(name)}_${DateTime.now().millisecondsSinceEpoch}.docx');
+  await file.writeAsBytes(ZipEncoder().encode(out)!);
+  return file;
+}
