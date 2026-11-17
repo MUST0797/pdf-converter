@@ -1,5 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
@@ -120,51 +122,99 @@ class _SinglePickScreenState extends State<SinglePickScreen> {
 
 // ---------- DOCX -> PDF ----------
 
-Future<File> docxToPdf(String path, String name) async {
-  final bytes = await File(path).readAsBytes();
-  final archive = ZipDecoder().decodeBytes(bytes);
-  final entry = archive.findFile('word/document.xml');
-  if (entry == null) throw Exception('Idhu valid .docx file illa');
-  final xmlStr = utf8.decode(entry.content as List<int>, allowMalformed: true);
-  final xml = XmlDocument.parse(xmlStr);
-  final bodies = xml.findAllElements('w:body');
-  if (bodies.isEmpty) throw Exception('DOCX-la content kidaikkala');
-
-  final widgets = <pw.Widget>[];
-  for (final el in bodies.first.children.whereType<XmlElement>()) {
-    final tag = el.name.qualified;
-    if (tag == 'w:p') {
-      widgets.add(_docxParagraph(el));
-    } else if (tag == 'w:tbl') {
-      widgets.add(_docxTable(el));
-    }
-  }
-
-  final doc = pw.Document();
-  doc.addPage(
-    pw.MultiPage(
-      pageFormat: PdfPageFormat.a4,
-      margin: const pw.EdgeInsets.all(40),
-      maxPages: 2000,
-      build: (_) => widgets.isEmpty ? [pw.Text(' ')] : widgets,
-    ),
-  );
-
-  final dir = await pdfDir();
-  final file = File(
-      '${dir.path}/${_baseName(name)}_${DateTime.now().millisecondsSinceEpoch}.pdf');
-  await file.writeAsBytes(await doc.save());
-  return file;
+class _Ctx {
+  final Archive archive;
+  final Map<String, String> rels;
+  _Ctx(this.archive, this.rels);
 }
 
-pw.Widget _docxParagraph(XmlElement p) {
+class _PRes {
+  final pw.Widget widget;
+  final double height;
+  _PRes(this.widget, this.height);
+}
+
+class _Img {
+  final pw.MemoryImage image;
+  final double w;
+  final double h;
+  _Img(this.image, this.w, this.h);
+}
+
+class _Part {
+  final List<pw.Widget> widgets;
+  final double height;
+  _Part(this.widgets, this.height);
+}
+
+double _twips(String? v) => (double.tryParse(v ?? '') ?? 0) / 20;
+
+Map<String, String> _loadRels(Archive a, String partPath) {
+  final idx = partPath.lastIndexOf('/');
+  final dir = partPath.substring(0, idx);
+  final name = partPath.substring(idx + 1);
+  final map = <String, String>{};
+  final f = a.findFile('$dir/_rels/$name.rels');
+  if (f == null) return map;
+  final doc = XmlDocument.parse(
+      utf8.decode(f.content as List<int>, allowMalformed: true));
+  for (final r in doc.findAllElements('Relationship')) {
+    final id = r.getAttribute('Id');
+    final t = r.getAttribute('Target');
+    if (id != null && t != null) {
+      map[id] = t.startsWith('/') ? t.substring(1) : '$dir/$t';
+    }
+  }
+  return map;
+}
+
+pw.MemoryImage? _loadImage(_Ctx c, String? rid) {
+  if (rid == null) return null;
+  final path = c.rels[rid];
+  if (path == null) return null;
+  final f = c.archive.findFile(path);
+  if (f == null) return null;
+  try {
+    return pw.MemoryImage(Uint8List.fromList(f.content as List<int>));
+  } catch (_) {
+    return null;
+  }
+}
+
+pw.InlineSpan _checkBox(XmlElement sym, double size) {
+  final ch = (sym.getAttribute('w:char') ?? '').toLowerCase();
+  const checked = {'f0fe', 'f0fd', 'f0fc', 'f0fb', 'f052'};
+  final s = size * 0.8;
+  final isChecked = checked.contains(ch);
+  return pw.WidgetSpan(
+    child: pw.Container(
+      width: s,
+      height: s,
+      margin: const pw.EdgeInsets.only(right: 1),
+      decoration: pw.BoxDecoration(border: pw.Border.all(width: 0.8)),
+      child: isChecked
+          ? pw.Container(
+              margin: const pw.EdgeInsets.all(2), color: PdfColors.black)
+          : null,
+    ),
+  );
+}
+
+_PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
   final pPr = p.getElement('w:pPr');
-  final style = (pPr?.getElement('w:pStyle')?.getAttribute('w:val') ?? '')
-      .toLowerCase();
   final jc = pPr?.getElement('w:jc')?.getAttribute('w:val');
-  final isHeading = style.startsWith('heading') || style == 'title';
+  final numbered = pPr?.getElement('w:numPr') != null;
+  final markSz = int.tryParse(
+      pPr?.getElement('w:rPr')?.getElement('w:sz')?.getAttribute('w:val') ??
+          '');
+  final markSize = markSz != null ? markSz / 2 : 10.5;
 
   final spans = <pw.InlineSpan>[];
+  final images = <_Img>[];
+  var maxSize = 0.0;
+  var textW = 0.0;
+  var breaks = 0;
+
   for (final r in p.findAllElements('w:r')) {
     final rPr = r.getElement('w:rPr');
     bool flag(String tag) {
@@ -174,93 +224,300 @@ pw.Widget _docxParagraph(XmlElement p) {
       return v != '0' && v != 'false';
     }
 
-    final bold = flag('w:b') || isHeading;
+    final bold = flag('w:b');
     final italic = flag('w:i');
     final sz = int.tryParse(rPr?.getElement('w:sz')?.getAttribute('w:val') ?? '');
-    var size = sz != null ? sz / 2 : 12.0;
-    if (isHeading && sz == null) size = 16;
+    final size = sz != null ? sz / 2 : 10.5;
+    final hex = rPr?.getElement('w:color')?.getAttribute('w:val');
+    PdfColor? color;
+    if (hex != null && hex.length == 6 && hex != 'auto') {
+      color = PdfColor.fromHex('#$hex');
+    }
+    final u = rPr?.getElement('w:u')?.getAttribute('w:val');
+    final style = pw.TextStyle(
+      fontSize: size,
+      fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+      fontStyle: italic ? pw.FontStyle.italic : pw.FontStyle.normal,
+      color: color,
+      decoration:
+          (u != null && u != 'none') ? pw.TextDecoration.underline : null,
+    );
+    if (size > maxSize) maxSize = size;
 
     final text = StringBuffer();
+    void flush() {
+      if (text.isNotEmpty) {
+        spans.add(pw.TextSpan(text: text.toString(), style: style));
+        text.clear();
+      }
+    }
+
     for (final c in r.children.whereType<XmlElement>()) {
       switch (c.name.qualified) {
         case 'w:t':
-          text.write(c.innerText);
+          final t = c.innerText;
+          text.write(t);
+          textW += t.length * size * (bold ? 0.68 : 0.58);
           break;
         case 'w:tab':
           text.write('    ');
+          textW += size * 1.2;
           break;
         case 'w:br':
           text.write('\n');
+          breaks++;
+          break;
+        case 'w:sym':
+          flush();
+          spans.add(_checkBox(c, size));
+          textW += size * 1.2;
           break;
       }
     }
-    if (text.isEmpty) continue;
+    flush();
 
-    spans.add(
-      pw.TextSpan(
-        text: text.toString(),
-        style: pw.TextStyle(
-          fontSize: size,
-          fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
-          fontStyle: italic ? pw.FontStyle.italic : pw.FontStyle.normal,
+    for (final inl in r.findAllElements('wp:inline')) {
+      final ext = inl.getElement('wp:extent');
+      final blip = inl.findAllElements('a:blip').firstOrNull;
+      final img = _loadImage(ctx, blip?.getAttribute('r:embed'));
+      if (img == null || ext == null) continue;
+      final cx = double.tryParse(ext.getAttribute('cx') ?? '') ?? 0;
+      final cy = double.tryParse(ext.getAttribute('cy') ?? '') ?? 0;
+      if (cx <= 0 || cy <= 0) continue;
+      images.add(_Img(img, cx / 12700, cy / 12700));
+    }
+  }
+
+  // Paragraph with inline images (logo etc.)
+  if (images.isNotEmpty) {
+    var totalW = 0.0;
+    for (final i in images) {
+      totalW += i.w;
+    }
+    final k = totalW > width ? width / totalW : 1.0;
+    var h = 0.0;
+    for (final i in images) {
+      if (i.h * k > h) h = i.h * k;
+    }
+    var align = pw.MainAxisAlignment.start;
+    if (images.length > 1) {
+      align = pw.MainAxisAlignment.spaceBetween;
+    } else if (jc == 'center') {
+      align = pw.MainAxisAlignment.center;
+    } else if (jc == 'right') {
+      align = pw.MainAxisAlignment.end;
+    }
+    return _PRes(
+      pw.Row(
+        mainAxisAlignment: align,
+        children: [
+          for (final i in images)
+            pw.Image(i.image, width: i.w * k, height: i.h * k),
+        ],
+      ),
+      h + 2,
+    );
+  }
+
+  // Empty paragraph
+  if (spans.isEmpty) {
+    final h = markSize * 1.25;
+    return _PRes(pw.SizedBox(height: h), h);
+  }
+
+  final size = maxSize > 0 ? maxSize : markSize;
+  var avail = width;
+  if (numbered) {
+    spans.insert(0, pw.TextSpan(text: '-  ', style: pw.TextStyle(fontSize: size)));
+    avail = width - 12;
+  }
+  var lines = (textW / (avail < 1 ? 1 : avail)).ceil();
+  if (lines < 1) lines = 1;
+  lines += breaks;
+  final h = lines * size * 1.3;
+
+  var ta = pw.TextAlign.left;
+  if (jc == 'center') ta = pw.TextAlign.center;
+  if (jc == 'right') ta = pw.TextAlign.right;
+
+  pw.Widget w = pw.RichText(text: pw.TextSpan(children: spans), textAlign: ta);
+  if (numbered) {
+    w = pw.Padding(padding: const pw.EdgeInsets.only(left: 12), child: w);
+  }
+  return _PRes(w, h);
+}
+
+List<pw.Widget> _docxTable(XmlElement tbl, _Ctx ctx, double contentW) {
+  final out = <pw.Widget>[];
+  for (final tr in tbl.findElements('w:tr')) {
+    final trH = _twips(
+        tr.getElement('w:trPr')?.getElement('w:trHeight')?.getAttribute('w:val'));
+    final cells = tr.findElements('w:tc').toList();
+    if (cells.isEmpty) continue;
+
+    final ws = <double>[];
+    var total = 0.0;
+    for (final tc in cells) {
+      final w = double.tryParse(
+              tc.getElement('w:tcPr')?.getElement('w:tcW')?.getAttribute('w:w') ??
+                  '') ??
+          1000;
+      ws.add(w);
+      total += w;
+    }
+
+    var rowH = trH;
+    final cellWidgets = <pw.Widget>[];
+    for (var i = 0; i < cells.length; i++) {
+      final cw = ws[i] / total * contentW;
+      final inner = cw - 10.8;
+      final kids = <pw.Widget>[];
+      var h = 3.0;
+      for (final p in cells[i].findElements('w:p')) {
+        final res = _paragraph(p, ctx, inner);
+        kids.add(res.widget);
+        h += res.height;
+      }
+      if (h > rowH) rowH = h;
+      cellWidgets.add(
+        pw.Expanded(
+          flex: ws[i].round(),
+          child: pw.Container(
+            padding: const pw.EdgeInsets.fromLTRB(5.4, 2, 5.4, 0),
+            decoration: pw.BoxDecoration(border: pw.Border.all(width: 0.4)),
+            child: pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: kids,
+            ),
+          ),
+        ),
+      );
+    }
+    out.add(
+      pw.SizedBox(
+        height: rowH,
+        child: pw.Row(
+          crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+          children: cellWidgets,
         ),
       ),
     );
   }
-
-  var align = pw.TextAlign.left;
-  if (jc == 'center') align = pw.TextAlign.center;
-  if (jc == 'right') align = pw.TextAlign.right;
-  if (jc == 'both') align = pw.TextAlign.justify;
-
-  return pw.Padding(
-    padding: const pw.EdgeInsets.only(bottom: 6),
-    child: spans.isEmpty
-        ? pw.SizedBox(height: 8)
-        : pw.RichText(
-            text: pw.TextSpan(children: spans),
-            textAlign: align,
-          ),
-  );
+  return out;
 }
 
-pw.Widget _docxTable(XmlElement tbl) {
-  final data = <List<String>>[];
-  var maxCols = 0;
-  for (final tr in tbl.findElements('w:tr')) {
-    final row = <String>[];
-    for (final tc in tr.findElements('w:tc')) {
-      final txt = tc
-          .findAllElements('w:p')
-          .map((p) => p.findAllElements('w:t').map((t) => t.innerText).join())
-          .join('\n');
-      row.add(txt);
+_Part _buildPart(Archive a, String? path, double width) {
+  if (path == null) return _Part([], 0);
+  final f = a.findFile(path);
+  if (f == null) return _Part([], 0);
+  final xml = XmlDocument.parse(
+      utf8.decode(f.content as List<int>, allowMalformed: true));
+  final ctx = _Ctx(a, _loadRels(a, path));
+  final out = <pw.Widget>[];
+  var h = 0.0;
+  for (final p in xml.rootElement.children.whereType<XmlElement>()) {
+    if (p.name.qualified != 'w:p') continue;
+    final hasRule = p
+        .findAllElements('wp:anchor')
+        .any((an) => an.findAllElements('a:blip').isEmpty);
+    if (hasRule) {
+      out.add(pw.SizedBox(
+          width: width,
+          height: 0.7,
+          child: pw.Container(color: PdfColors.black)));
+      out.add(pw.SizedBox(height: 3));
+      h += 3.7;
     }
-    if (row.isNotEmpty) {
-      data.add(row);
-      if (row.length > maxCols) maxCols = row.length;
+    final r = _paragraph(p, ctx, width);
+    out.add(r.widget);
+    h += r.height;
+  }
+  return _Part(out, h);
+}
+
+Future<File> docxToPdf(String path, String name) async {
+  final bytes = await File(path).readAsBytes();
+  final archive = ZipDecoder().decodeBytes(bytes);
+  final entry = archive.findFile('word/document.xml');
+  if (entry == null) throw Exception('Idhu valid .docx file illa');
+  final xml = XmlDocument.parse(
+      utf8.decode(entry.content as List<int>, allowMalformed: true));
+  final bodies = xml.findAllElements('w:body');
+  if (bodies.isEmpty) throw Exception('DOCX-la content kidaikkala');
+  final body = bodies.first;
+
+  // Page setup
+  final sect = body.getElement('w:sectPr');
+  final pgSz = sect?.getElement('w:pgSz');
+  final pgMar = sect?.getElement('w:pgMar');
+  double tw(XmlElement? e, String attr, double def) {
+    final v = double.tryParse(e?.getAttribute(attr) ?? '');
+    return v == null ? def : v / 20;
+  }
+
+  final pageW = tw(pgSz, 'w:w', 595.3);
+  final pageH = tw(pgSz, 'w:h', 841.9);
+  final mt = tw(pgMar, 'w:top', 72);
+  final mb = tw(pgMar, 'w:bottom', 72);
+  final ml = tw(pgMar, 'w:left', 72);
+  final mr = tw(pgMar, 'w:right', 72);
+  final hd = tw(pgMar, 'w:header', 36);
+  final fd = tw(pgMar, 'w:footer', 36);
+  final contentW = pageW - ml - mr;
+
+  // Header / footer
+  final docRels = _loadRels(archive, 'word/document.xml');
+  String? refPath(String tag) {
+    final id = sect?.getElement(tag)?.getAttribute('r:id');
+    return id == null ? null : docRels[id];
+  }
+
+  final header = _buildPart(archive, refPath('w:headerReference'), contentW);
+  final footer = _buildPart(archive, refPath('w:footerReference'), contentW);
+  final hasHeader = header.widgets.isNotEmpty;
+  final hasFooter = footer.widgets.isNotEmpty;
+  final headerPad = math.max(0.0, (mt - hd) - header.height) + 4;
+
+  // Body
+  final ctx = _Ctx(archive, docRels);
+  final widgets = <pw.Widget>[];
+  for (final el in body.children.whereType<XmlElement>()) {
+    final tag = el.name.qualified;
+    if (tag == 'w:p') {
+      widgets.add(_paragraph(el, ctx, contentW).widget);
+    } else if (tag == 'w:tbl') {
+      widgets.addAll(_docxTable(el, ctx, contentW));
     }
   }
-  if (data.isEmpty) return pw.SizedBox();
 
-  final rows = data.map((row) {
-    final cells = <pw.Widget>[
-      for (final t in row)
-        pw.Padding(
-          padding: const pw.EdgeInsets.all(4),
-          child: pw.Text(t, style: const pw.TextStyle(fontSize: 11)),
-        ),
-    ];
-    while (cells.length < maxCols) {
-      cells.add(pw.SizedBox());
-    }
-    return pw.TableRow(children: cells);
-  }).toList();
-
-  return pw.Padding(
-    padding: const pw.EdgeInsets.only(bottom: 8),
-    child: pw.Table(border: pw.TableBorder.all(), children: rows),
+  final doc = pw.Document();
+  doc.addPage(
+    pw.MultiPage(
+      pageFormat: PdfPageFormat(pageW, pageH),
+      margin: pw.EdgeInsets.fromLTRB(
+          ml, hasHeader ? hd : mt, mr, hasFooter ? fd : mb),
+      maxPages: 2000,
+      header: hasHeader
+          ? (pw.Context c) => pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: [...header.widgets, pw.SizedBox(height: headerPad)],
+              )
+          : null,
+      footer: hasFooter
+          ? (pw.Context c) => pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: footer.widgets,
+              )
+          : null,
+      build: (_) => widgets.isEmpty ? [pw.Text(' ')] : widgets,
+    ),
   );
+
+  final dir = await pdfDir();
+  final file = File(
+      '${dir.path}/${_baseName(name)}_${DateTime.now().millisecondsSinceEpoch}.pdf');
+  await file.writeAsBytes(await doc.save());
+  return file;
 }
 
 // ---------- PDF -> DOCX ----------
