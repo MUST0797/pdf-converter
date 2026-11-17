@@ -11,6 +11,8 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 
+import 'office_tools.dart';
+
 void main() => runApp(const PdfApp());
 
 class PdfApp extends StatelessWidget {
@@ -109,8 +111,22 @@ class HomeScreen extends StatelessWidget {
           () => _go(context, const ImageToPdfScreen())),
       _Tool('TXT → PDF', Icons.text_snippet, true,
           () => _go(context, const TxtToPdfScreen())),
-      _Tool('DOCX → PDF', Icons.description, false, null),
-      _Tool('PDF → DOCX', Icons.picture_as_pdf, false, null),
+      _Tool('DOCX → PDF', Icons.description, true,
+          () => _go(
+              context,
+              SinglePickScreen(
+                  title: 'DOCX → PDF',
+                  extension: 'docx',
+                  icon: Icons.description,
+                  onConvert: docxToPdf))),
+      _Tool('PDF → DOCX', Icons.picture_as_pdf, true,
+          () => _go(
+              context,
+              SinglePickScreen(
+                  title: 'PDF → DOCX',
+                  extension: 'pdf',
+                  icon: Icons.picture_as_pdf,
+                  onConvert: pdfToDocx))),
     ];
     return Scaffold(
       appBar: AppBar(
@@ -420,8 +436,7 @@ class ResultScreen extends StatelessWidget {
             SizedBox(
               width: double.infinity,
               child: OutlinedButton.icon(
-                onPressed: () =>
-                    Share.shareXFiles([XFile(file.path)]),
+                onPressed: () => Share.shareXFiles([XFile(file.path)]),
                 icon: const Icon(Icons.share),
                 label: const Text('Share'),
               ),
@@ -469,7 +484,8 @@ class _MyFilesScreenState extends State<MyFilesScreen> {
     final list = dir
         .listSync()
         .whereType<File>()
-        .where((f) => f.path.toLowerCase().endsWith('.pdf') ||
+        .where((f) =>
+            f.path.toLowerCase().endsWith('.pdf') ||
             f.path.toLowerCase().endsWith('.docx'))
         .toList()
       ..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
@@ -529,8 +545,7 @@ class _MyFilesScreenState extends State<MyFilesScreen> {
                         children: [
                           IconButton(
                             icon: const Icon(Icons.share),
-                            onPressed: () =>
-                                Share.shareXFiles([XFile(f.path)]),
+                            onPressed: () => Share.shareXFiles([XFile(f.path)]),
                           ),
                           IconButton(
                             icon: const Icon(Icons.delete_outline),
