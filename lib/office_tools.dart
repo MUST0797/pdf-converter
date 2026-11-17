@@ -122,10 +122,19 @@ class _SinglePickScreenState extends State<SinglePickScreen> {
 
 // ---------- DOCX -> PDF ----------
 
+class _Styles {
+  final double size;
+  final bool bold;
+  final String? color;
+  final double after;
+  _Styles(this.size, this.bold, this.color, this.after);
+}
+
 class _Ctx {
   final Archive archive;
   final Map<String, String> rels;
-  _Ctx(this.archive, this.rels);
+  final _Styles styles;
+  _Ctx(this.archive, this.rels, this.styles);
 }
 
 class _PRes {
@@ -134,11 +143,11 @@ class _PRes {
   _PRes(this.widget, this.height);
 }
 
-class _Img {
-  final pw.MemoryImage image;
+class _Block {
+  final pw.Widget widget;
   final double w;
   final double h;
-  _Img(this.image, this.w, this.h);
+  _Block(this.widget, this.w, this.h);
 }
 
 class _Part {
@@ -148,6 +157,50 @@ class _Part {
 }
 
 double _twips(String? v) => (double.tryParse(v ?? '') ?? 0) / 20;
+
+double _num(XmlElement? el, String name, double def) =>
+    double.tryParse(el?.getAttribute(name) ?? '') ?? def;
+
+_Styles _loadStyles(Archive a) {
+  var size = 10.5;
+  var bold = false;
+  String? color;
+  var after = 0.0;
+  final f = a.findFile('word/styles.xml');
+  if (f != null) {
+    final doc = XmlDocument.parse(
+        utf8.decode(f.content as List<int>, allowMalformed: true));
+    void applyRPr(XmlElement? rPr) {
+      if (rPr == null) return;
+      final sz = int.tryParse(rPr.getElement('w:sz')?.getAttribute('w:val') ?? '');
+      if (sz != null) size = sz / 2;
+      final b = rPr.getElement('w:b');
+      if (b != null) {
+        final v = b.getAttribute('w:val');
+        bold = v != '0' && v != 'false';
+      }
+      final c = rPr.getElement('w:color')?.getAttribute('w:val');
+      if (c != null && c.length == 6) color = c;
+    }
+
+    void applyPPr(XmlElement? pPr) {
+      final v = pPr?.getElement('w:spacing')?.getAttribute('w:after');
+      if (v != null) after = _twips(v);
+    }
+
+    final dd = doc.findAllElements('w:docDefaults').firstOrNull;
+    applyRPr(dd?.getElement('w:rPrDefault')?.getElement('w:rPr'));
+    applyPPr(dd?.getElement('w:pPrDefault')?.getElement('w:pPr'));
+    for (final st in doc.findAllElements('w:style')) {
+      if (st.getAttribute('w:type') == 'paragraph' &&
+          st.getAttribute('w:default') == '1') {
+        applyRPr(st.getElement('w:rPr'));
+        applyPPr(st.getElement('w:pPr'));
+      }
+    }
+  }
+  return _Styles(size, bold, color, after);
+}
 
 Map<String, String> _loadRels(Archive a, String partPath) {
   final idx = partPath.lastIndexOf('/');
@@ -181,18 +234,21 @@ pw.MemoryImage? _loadImage(_Ctx c, String? rid) {
   }
 }
 
-pw.InlineSpan _checkBox(XmlElement sym, double size) {
-  final ch = (sym.getAttribute('w:char') ?? '').toLowerCase();
-  const checked = {'f0fe', 'f0fd', 'f0fc', 'f0fb', 'f052'};
+// Wingdings codes that mean "checked box"; everything else = empty box
+const _checkedCodes = {0xFE, 0xFD, 0xFC, 0xFB, 0x52};
+
+pw.InlineSpan _boxSpan(double size, bool checked, bool shaded) {
   final s = size * 0.8;
-  final isChecked = checked.contains(ch);
   return pw.WidgetSpan(
     child: pw.Container(
       width: s,
       height: s,
       margin: const pw.EdgeInsets.only(right: 1),
-      decoration: pw.BoxDecoration(border: pw.Border.all(width: 0.8)),
-      child: isChecked
+      decoration: pw.BoxDecoration(
+        color: shaded ? PdfColors.grey400 : null,
+        border: pw.Border.all(width: 0.8),
+      ),
+      child: checked
           ? pw.Container(
               margin: const pw.EdgeInsets.all(2), color: PdfColors.black)
           : null,
@@ -200,40 +256,126 @@ pw.InlineSpan _checkBox(XmlElement sym, double size) {
   );
 }
 
+// Inline drawing: single picture or a group (logo + title, footer image + line)
+_Block? _drawing(XmlElement inl, _Ctx ctx, double maxW) {
+  final ext = inl.getElement('wp:extent');
+  final cx = _num(ext, 'cx', 0);
+  final cy = _num(ext, 'cy', 0);
+  if (cx <= 0 || cy <= 0) return null;
+  const emu = 12700.0;
+  final gw = cx / emu;
+  final gh = cy / emu;
+  final k = gw > maxW ? maxW / gw : 1.0;
+
+  final grp = inl.findAllElements('wpg:wgp').firstOrNull;
+  if (grp == null) {
+    final blip = inl.findAllElements('a:blip').firstOrNull;
+    final img = _loadImage(ctx, blip?.getAttribute('r:embed'));
+    if (img == null) return null;
+    return _Block(
+        pw.Image(img, width: gw * k, height: gh * k), gw * k, gh * k);
+  }
+
+  final xf = grp.getElement('wpg:grpSpPr')?.getElement('a:xfrm');
+  final gx = _num(xf?.getElement('a:ext'), 'cx', cx);
+  final gy = _num(xf?.getElement('a:ext'), 'cy', cy);
+  final chx = _num(xf?.getElement('a:chExt'), 'cx', gx);
+  final chy = _num(xf?.getElement('a:chExt'), 'cy', gy);
+  final sx = chx > 0 ? gx / chx : 1.0;
+  final sy = chy > 0 ? gy / chy : 1.0;
+
+  final items = <pw.Widget>[];
+  for (final pic in grp.findAllElements('pic:pic')) {
+    final blip = pic.findAllElements('a:blip').firstOrNull;
+    final img = _loadImage(ctx, blip?.getAttribute('r:embed'));
+    final xfrm = pic.findAllElements('a:xfrm').firstOrNull;
+    if (img == null || xfrm == null) continue;
+    final ox = _num(xfrm.getElement('a:off'), 'x', 0);
+    final oy = _num(xfrm.getElement('a:off'), 'y', 0);
+    final ew = _num(xfrm.getElement('a:ext'), 'cx', 0);
+    final eh = _num(xfrm.getElement('a:ext'), 'cy', 0);
+    if (ew <= 0 || eh <= 0) continue;
+    items.add(
+      pw.Positioned(
+        left: ox * sx / emu * k,
+        top: oy * sy / emu * k,
+        child: pw.Image(img, width: ew * sx / emu * k, height: eh * sy / emu * k),
+      ),
+    );
+  }
+  for (final wsp in grp.findAllElements('wps:wsp')) {
+    final xfrm = wsp.findAllElements('a:xfrm').firstOrNull;
+    if (xfrm == null) continue;
+    final ew = _num(xfrm.getElement('a:ext'), 'cx', 0);
+    final eh = _num(xfrm.getElement('a:ext'), 'cy', 0);
+    // only thin horizontal lines (footer rule)
+    if (ew < 100000 || eh > 38100) continue;
+    final ox = _num(xfrm.getElement('a:off'), 'x', 0);
+    final oy = _num(xfrm.getElement('a:off'), 'y', 0);
+    items.add(
+      pw.Positioned(
+        left: ox * sx / emu * k,
+        top: oy * sy / emu * k,
+        child: pw.SizedBox(
+          width: ew * sx / emu * k,
+          height: 0.7,
+          child: pw.Container(color: PdfColors.black),
+        ),
+      ),
+    );
+  }
+  return _Block(
+    pw.SizedBox(
+      width: gw * k,
+      height: gh * k,
+      child: pw.Stack(children: items),
+    ),
+    gw * k,
+    gh * k,
+  );
+}
+
 _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
+  final st = ctx.styles;
   final pPr = p.getElement('w:pPr');
   final jc = pPr?.getElement('w:jc')?.getAttribute('w:val');
   final numbered = pPr?.getElement('w:numPr') != null;
   final markSz = int.tryParse(
       pPr?.getElement('w:rPr')?.getElement('w:sz')?.getAttribute('w:val') ??
           '');
-  final markSize = markSz != null ? markSz / 2 : 10.5;
+  final markSize = markSz != null ? markSz / 2 : st.size;
+  final spAfter = pPr?.getElement('w:spacing')?.getAttribute('w:after');
+  final after = spAfter != null ? _twips(spAfter) : st.after;
 
   final spans = <pw.InlineSpan>[];
-  final images = <_Img>[];
+  final blocks = <_Block>[];
   var maxSize = 0.0;
   var textW = 0.0;
   var breaks = 0;
 
   for (final r in p.findAllElements('w:r')) {
     final rPr = r.getElement('w:rPr');
-    bool flag(String tag) {
+    bool flag(String tag, bool def) {
       final e = rPr?.getElement(tag);
-      if (e == null) return false;
+      if (e == null) return def;
       final v = e.getAttribute('w:val');
       return v != '0' && v != 'false';
     }
 
-    final bold = flag('w:b');
-    final italic = flag('w:i');
+    final bold = flag('w:b', st.bold);
+    final italic = flag('w:i', false);
     final sz = int.tryParse(rPr?.getElement('w:sz')?.getAttribute('w:val') ?? '');
-    final size = sz != null ? sz / 2 : 10.5;
-    final hex = rPr?.getElement('w:color')?.getAttribute('w:val');
+    final size = sz != null ? sz / 2 : st.size;
+    final hex = rPr?.getElement('w:color')?.getAttribute('w:val') ?? st.color;
     PdfColor? color;
     if (hex != null && hex.length == 6 && hex != 'auto') {
       color = PdfColor.fromHex('#$hex');
     }
     final u = rPr?.getElement('w:u')?.getAttribute('w:val');
+    final fontName =
+        (rPr?.getElement('w:rFonts')?.getAttribute('w:ascii') ?? '').toLowerCase();
+    final isSym = fontName.startsWith('wingdings');
+    final shaded = rPr?.getElement('w:highlight') != null;
     final style = pw.TextStyle(
       fontSize: size,
       fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
@@ -256,8 +398,16 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
       switch (c.name.qualified) {
         case 'w:t':
           final t = c.innerText;
-          text.write(t);
-          textW += t.length * size * (bold ? 0.68 : 0.58);
+          if (isSym) {
+            flush();
+            for (final rune in t.runes) {
+              spans.add(_boxSpan(size, _checkedCodes.contains(rune & 0xFF), shaded));
+              textW += size * 1.2;
+            }
+          } else {
+            text.write(t);
+            textW += t.length * size * (bold ? 0.68 : 0.58);
+          }
           break;
         case 'w:tab':
           text.write('    ');
@@ -269,7 +419,8 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
           break;
         case 'w:sym':
           flush();
-          spans.add(_checkBox(c, size));
+          final code = int.tryParse(c.getAttribute('w:char') ?? '', radix: 16) ?? 0;
+          spans.add(_boxSpan(size, _checkedCodes.contains(code & 0xFF), shaded));
           textW += size * 1.2;
           break;
       }
@@ -277,30 +428,19 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
     flush();
 
     for (final inl in r.findAllElements('wp:inline')) {
-      final ext = inl.getElement('wp:extent');
-      final blip = inl.findAllElements('a:blip').firstOrNull;
-      final img = _loadImage(ctx, blip?.getAttribute('r:embed'));
-      if (img == null || ext == null) continue;
-      final cx = double.tryParse(ext.getAttribute('cx') ?? '') ?? 0;
-      final cy = double.tryParse(ext.getAttribute('cy') ?? '') ?? 0;
-      if (cx <= 0 || cy <= 0) continue;
-      images.add(_Img(img, cx / 12700, cy / 12700));
+      final b = _drawing(inl, ctx, width);
+      if (b != null) blocks.add(b);
     }
   }
 
-  // Paragraph with inline images (logo etc.)
-  if (images.isNotEmpty) {
-    var totalW = 0.0;
-    for (final i in images) {
-      totalW += i.w;
-    }
-    final k = totalW > width ? width / totalW : 1.0;
+  // Paragraph with drawings (logo, footer image etc.)
+  if (blocks.isNotEmpty) {
     var h = 0.0;
-    for (final i in images) {
-      if (i.h * k > h) h = i.h * k;
+    for (final b in blocks) {
+      if (b.h > h) h = b.h;
     }
     var align = pw.MainAxisAlignment.start;
-    if (images.length > 1) {
+    if (blocks.length > 1) {
       align = pw.MainAxisAlignment.spaceBetween;
     } else if (jc == 'center') {
       align = pw.MainAxisAlignment.center;
@@ -310,10 +450,7 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
     return _PRes(
       pw.Row(
         mainAxisAlignment: align,
-        children: [
-          for (final i in images)
-            pw.Image(i.image, width: i.w * k, height: i.h * k),
-        ],
+        children: [for (final b in blocks) b.widget],
       ),
       h + 2,
     );
@@ -321,7 +458,7 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
 
   // Empty paragraph
   if (spans.isEmpty) {
-    final h = markSize * 1.25;
+    final h = markSize * 1.25 + after;
     return _PRes(pw.SizedBox(height: h), h);
   }
 
@@ -334,7 +471,7 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
   var lines = (textW / (avail < 1 ? 1 : avail)).ceil();
   if (lines < 1) lines = 1;
   lines += breaks;
-  final h = lines * size * 1.3;
+  final h = lines * size * 1.3 + after;
 
   var ta = pw.TextAlign.left;
   if (jc == 'center') ta = pw.TextAlign.center;
@@ -343,6 +480,9 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
   pw.Widget w = pw.RichText(text: pw.TextSpan(children: spans), textAlign: ta);
   if (numbered) {
     w = pw.Padding(padding: const pw.EdgeInsets.only(left: 12), child: w);
+  }
+  if (after > 0) {
+    w = pw.Padding(padding: pw.EdgeInsets.only(bottom: after), child: w);
   }
   return _PRes(w, h);
 }
@@ -406,13 +546,13 @@ List<pw.Widget> _docxTable(XmlElement tbl, _Ctx ctx, double contentW) {
   return out;
 }
 
-_Part _buildPart(Archive a, String? path, double width) {
+_Part _buildPart(Archive a, String? path, double width, _Styles styles) {
   if (path == null) return _Part([], 0);
   final f = a.findFile(path);
   if (f == null) return _Part([], 0);
   final xml = XmlDocument.parse(
       utf8.decode(f.content as List<int>, allowMalformed: true));
-  final ctx = _Ctx(a, _loadRels(a, path));
+  final ctx = _Ctx(a, _loadRels(a, path), styles);
   final out = <pw.Widget>[];
   var h = 0.0;
   for (final p in xml.rootElement.children.whereType<XmlElement>()) {
@@ -441,159 +581,4 @@ Future<File> docxToPdf(String path, String name) async {
   final entry = archive.findFile('word/document.xml');
   if (entry == null) throw Exception('Idhu valid .docx file illa');
   final xml = XmlDocument.parse(
-      utf8.decode(entry.content as List<int>, allowMalformed: true));
-  final bodies = xml.findAllElements('w:body');
-  if (bodies.isEmpty) throw Exception('DOCX-la content kidaikkala');
-  final body = bodies.first;
-
-  // Page setup
-  final sect = body.getElement('w:sectPr');
-  final pgSz = sect?.getElement('w:pgSz');
-  final pgMar = sect?.getElement('w:pgMar');
-  double tw(XmlElement? e, String attr, double def) {
-    final v = double.tryParse(e?.getAttribute(attr) ?? '');
-    return v == null ? def : v / 20;
-  }
-
-  final pageW = tw(pgSz, 'w:w', 595.3);
-  final pageH = tw(pgSz, 'w:h', 841.9);
-  final mt = tw(pgMar, 'w:top', 72);
-  final mb = tw(pgMar, 'w:bottom', 72);
-  final ml = tw(pgMar, 'w:left', 72);
-  final mr = tw(pgMar, 'w:right', 72);
-  final hd = tw(pgMar, 'w:header', 36);
-  final fd = tw(pgMar, 'w:footer', 36);
-  final contentW = pageW - ml - mr;
-
-  // Header / footer
-  final docRels = _loadRels(archive, 'word/document.xml');
-  String? refPath(String tag) {
-    final id = sect?.getElement(tag)?.getAttribute('r:id');
-    return id == null ? null : docRels[id];
-  }
-
-  final header = _buildPart(archive, refPath('w:headerReference'), contentW);
-  final footer = _buildPart(archive, refPath('w:footerReference'), contentW);
-  final hasHeader = header.widgets.isNotEmpty;
-  final hasFooter = footer.widgets.isNotEmpty;
-  final headerPad = math.max(0.0, (mt - hd) - header.height) + 4;
-
-  // Body
-  final ctx = _Ctx(archive, docRels);
-  final widgets = <pw.Widget>[];
-  for (final el in body.children.whereType<XmlElement>()) {
-    final tag = el.name.qualified;
-    if (tag == 'w:p') {
-      widgets.add(_paragraph(el, ctx, contentW).widget);
-    } else if (tag == 'w:tbl') {
-      widgets.addAll(_docxTable(el, ctx, contentW));
-    }
-  }
-
-  final doc = pw.Document();
-  doc.addPage(
-    pw.MultiPage(
-      pageFormat: PdfPageFormat(pageW, pageH),
-      margin: pw.EdgeInsets.fromLTRB(
-          ml, hasHeader ? hd : mt, mr, hasFooter ? fd : mb),
-      maxPages: 2000,
-      header: hasHeader
-          ? (pw.Context c) => pw.Column(
-                crossAxisAlignment: pw.CrossAxisAlignment.start,
-                children: [...header.widgets, pw.SizedBox(height: headerPad)],
-              )
-          : null,
-      footer: hasFooter
-          ? (pw.Context c) => pw.Column(
-                crossAxisAlignment: pw.CrossAxisAlignment.start,
-                children: footer.widgets,
-              )
-          : null,
-      build: (_) => widgets.isEmpty ? [pw.Text(' ')] : widgets,
-    ),
-  );
-
-  final dir = await pdfDir();
-  final file = File(
-      '${dir.path}/${_baseName(name)}_${DateTime.now().millisecondsSinceEpoch}.pdf');
-  await file.writeAsBytes(await doc.save());
-  return file;
-}
-
-// ---------- PDF -> DOCX ----------
-
-String _xmlEsc(String s) => s
-    .replaceAll(RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]'), '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;');
-
-Future<File> pdfToDocx(String path, String name) async {
-  final bytes = await File(path).readAsBytes();
-  final sfDoc = sf.PdfDocument(inputBytes: bytes);
-  final extractor = sf.PdfTextExtractor(sfDoc);
-
-  final pages = <List<String>>[];
-  var total = 0;
-  for (var i = 0; i < sfDoc.pages.count; i++) {
-    final t = extractor.extractText(startPageIndex: i, endPageIndex: i);
-    total += t.trim().length;
-    pages.add(
-      t.replaceAll('\r\n', '\n').split('\n').map((l) => l.trimRight()).toList(),
-    );
-  }
-  sfDoc.dispose();
-
-  if (total == 0) {
-    throw Exception(
-        'Idhu scanned (image) PDF. Text illa, v1-la support illa.');
-  }
-
-  final body = StringBuffer();
-  for (var i = 0; i < pages.length; i++) {
-    for (final line in pages[i]) {
-      body.write(
-          '<w:p><w:r><w:t xml:space="preserve">${_xmlEsc(line)}</w:t></w:r></w:p>');
-    }
-    if (i < pages.length - 1) {
-      body.write('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
-    }
-  }
-
-  const header = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
-  final docXml = '$header'
-      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-      '<w:body>$body'
-      '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
-      '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" '
-      'w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>'
-      '</w:body></w:document>';
-
-  const contentTypes = '$header'
-      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-      '<Default Extension="xml" ContentType="application/xml"/>'
-      '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-      '</Types>';
-
-  const rels = '$header'
-      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
-      '</Relationships>';
-
-  final out = Archive();
-  void add(String n, String content) {
-    final b = utf8.encode(content);
-    out.addFile(ArchiveFile(n, b.length, b));
-  }
-
-  add('[Content_Types].xml', contentTypes);
-  add('_rels/.rels', rels);
-  add('word/document.xml', docXml);
-
-  final dir = await pdfDir();
-  final file = File(
-      '${dir.path}/${_baseName(name)}_${DateTime.now().millisecondsSinceEpoch}.docx');
-  await file.writeAsBytes(ZipEncoder().encode(out)!);
-  return file;
-}
+      utf8.decode(entry.content as List
