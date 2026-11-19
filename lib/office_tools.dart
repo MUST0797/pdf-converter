@@ -335,10 +335,53 @@ _Block? _drawing(XmlElement inl, _Ctx ctx, double maxW) {
   );
 }
 
+// Built-in PDF fonts only support Latin-1; map common symbols to safe text
+String _sanitize(String s) {
+  const map = {
+    '\u2013': '-',
+    '\u2014': '-',
+    '\u2212': '-',
+    '\u2264': '<=',
+    '\u2265': '>=',
+    '\u2018': "'",
+    '\u2019': "'",
+    '\u201C': '"',
+    '\u201D': '"',
+    '\u2026': '...',
+    '\u2022': '-',
+    '\u00A0': ' ',
+    '\u2192': '->',
+  };
+  final b = StringBuffer();
+  for (final r in s.runes) {
+    final ch = String.fromCharCode(r);
+    b.write(map[ch] ?? ch);
+  }
+  return b.toString();
+}
+
 _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
   final st = ctx.styles;
   final pPr = p.getElement('w:pPr');
-  final jc = pPr?.getElement('w:jc')?.getAttribute('w:val');
+  var jc = pPr?.getElement('w:jc')?.getAttribute('w:val');
+  final tabEls = pPr?.getElement('w:tabs')?.findElements('w:tab').toList() ??
+      <XmlElement>[];
+  final hasCenterTab = tabEls.any((t) => t.getAttribute('w:val') == 'center');
+  final hasRightTab = tabEls.any((t) => t.getAttribute('w:val') == 'right');
+  final firstRun = p.findAllElements('w:r').firstOrNull;
+  final firstKid = firstRun?.children
+      .whereType<XmlElement>()
+      .where((c) => c.name.qualified != 'w:rPr')
+      .firstOrNull;
+  String? tabAlign;
+  if (jc == null && firstKid?.name.qualified == 'w:tab') {
+    if (hasCenterTab) {
+      tabAlign = 'center';
+    } else if (hasRightTab) {
+      tabAlign = 'right';
+    }
+  }
+  if (tabAlign != null) jc = tabAlign;
   final numbered = pPr?.getElement('w:numPr') != null;
   final markSz = int.tryParse(
       pPr?.getElement('w:rPr')?.getElement('w:sz')?.getAttribute('w:val') ??
@@ -365,7 +408,11 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
     final bold = flag('w:b', st.bold);
     final italic = flag('w:i', false);
     final sz = int.tryParse(rPr?.getElement('w:sz')?.getAttribute('w:val') ?? '');
-    final size = sz != null ? sz / 2 : st.size;
+    final font0 =
+        (rPr?.getElement('w:rFonts')?.getAttribute('w:ascii') ?? '').toLowerCase();
+    // Calibri is narrower than Helvetica: shrink a bit to keep the same wrapping
+    final scale = font0.startsWith('calibri') ? 0.9 : 1.0;
+    final size = (sz != null ? sz / 2 : st.size) * scale;
     final hex = rPr?.getElement('w:color')?.getAttribute('w:val') ?? st.color;
     PdfColor? color;
     if (hex != null && hex.length == 6 && hex != 'auto') {
@@ -397,7 +444,7 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
     for (final c in r.children.whereType<XmlElement>()) {
       switch (c.name.qualified) {
         case 'w:t':
-          final t = c.innerText;
+          final t = _sanitize(c.innerText);
           if (isSym) {
             flush();
             for (final rune in t.runes) {
@@ -410,6 +457,7 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
           }
           break;
         case 'w:tab':
+          if (tabAlign != null && spans.isEmpty && text.isEmpty) break;
           text.write('    ');
           textW += size * 1.2;
           break;
@@ -487,61 +535,87 @@ _PRes _paragraph(XmlElement p, _Ctx ctx, double width) {
   return _PRes(w, h);
 }
 
-List<pw.Widget> _docxTable(XmlElement tbl, _Ctx ctx, double contentW) {
-  final out = <pw.Widget>[];
-  for (final tr in tbl.findElements('w:tr')) {
+pw.Widget _tableGroup(
+    List<XmlElement> trs, List<double> ws, _Ctx ctx, double contentW) {
+  var total = 0.0;
+  for (final w in ws) {
+    total += w;
+  }
+  final colWidths = <int, pw.TableColumnWidth>{
+    for (var i = 0; i < ws.length; i++) i: pw.FlexColumnWidth(ws[i]),
+  };
+  final rows = <pw.TableRow>[];
+  for (final tr in trs) {
     final trH = _twips(
         tr.getElement('w:trPr')?.getElement('w:trHeight')?.getAttribute('w:val'));
     final cells = tr.findElements('w:tc').toList();
-    if (cells.isEmpty) continue;
-
-    final ws = <double>[];
-    var total = 0.0;
-    for (final tc in cells) {
-      final w = double.tryParse(
-              tc.getElement('w:tcPr')?.getElement('w:tcW')?.getAttribute('w:w') ??
-                  '') ??
-          1000;
-      ws.add(w);
-      total += w;
-    }
-
-    var rowH = trH;
-    final cellWidgets = <pw.Widget>[];
+    final kids = <pw.Widget>[];
     for (var i = 0; i < cells.length; i++) {
-      final cw = ws[i] / total * contentW;
-      final inner = cw - 10.8;
-      final kids = <pw.Widget>[];
-      var h = 3.0;
-      for (final p in cells[i].findElements('w:p')) {
-        final res = _paragraph(p, ctx, inner);
-        kids.add(res.widget);
-        h += res.height;
+      final fill =
+          cells[i].getElement('w:tcPr')?.getElement('w:shd')?.getAttribute('w:fill');
+      PdfColor? bg;
+      if (fill != null && fill.length == 6 && fill.toUpperCase() != 'FFFFFF') {
+        bg = PdfColor.fromHex('#$fill');
       }
-      if (h > rowH) rowH = h;
-      cellWidgets.add(
-        pw.Expanded(
-          flex: ws[i].round(),
-          child: pw.Container(
-            padding: const pw.EdgeInsets.fromLTRB(5.4, 2, 5.4, 0),
-            decoration: pw.BoxDecoration(border: pw.Border.all(width: 0.4)),
-            child: pw.Column(
-              crossAxisAlignment: pw.CrossAxisAlignment.start,
-              children: kids,
-            ),
+      final inner = ws[i] / total * contentW - 10.8;
+      final paras = <pw.Widget>[];
+      for (final p in cells[i].findElements('w:p')) {
+        paras.add(_paragraph(p, ctx, inner).widget);
+      }
+      kids.add(
+        pw.Container(
+          color: bg,
+          constraints: trH > 0 ? pw.BoxConstraints(minHeight: trH) : null,
+          padding: const pw.EdgeInsets.fromLTRB(5.4, 1, 5.4, 1),
+          child: pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            mainAxisSize: pw.MainAxisSize.min,
+            children: paras,
           ),
         ),
       );
     }
-    out.add(
-      pw.SizedBox(
-        height: rowH,
-        child: pw.Row(
-          crossAxisAlignment: pw.CrossAxisAlignment.stretch,
-          children: cellWidgets,
-        ),
-      ),
-    );
+    rows.add(pw.TableRow(children: kids));
+  }
+  return pw.Table(
+    columnWidths: colWidths,
+    border: pw.TableBorder.all(width: 0.4),
+    defaultVerticalAlignment: pw.TableCellVerticalAlignment.full,
+    children: rows,
+  );
+}
+
+// Rows with the same column widths go in one table; row height = natural
+// text height (so nothing gets clipped and everything fits like Word).
+List<pw.Widget> _docxTable(XmlElement tbl, _Ctx ctx, double contentW) {
+  final out = <pw.Widget>[];
+  List<XmlElement> group = [];
+  List<double> groupW = [];
+  for (final tr in tbl.findElements('w:tr')) {
+    final cells = tr.findElements('w:tc').toList();
+    if (cells.isEmpty) continue;
+    final ws = <double>[
+      for (final tc in cells)
+        _num(tc.getElement('w:tcPr')?.getElement('w:tcW'), 'w:w', 1000),
+    ];
+    var same = group.isNotEmpty && ws.length == groupW.length;
+    if (same) {
+      for (var i = 0; i < ws.length; i++) {
+        if ((ws[i] - groupW[i]).abs() > 1) {
+          same = false;
+          break;
+        }
+      }
+    }
+    if (!same && group.isNotEmpty) {
+      out.add(_tableGroup(group, groupW, ctx, contentW));
+      group = [];
+    }
+    groupW = ws;
+    group.add(tr);
+  }
+  if (group.isNotEmpty) {
+    out.add(_tableGroup(group, groupW, ctx, contentW));
   }
   return out;
 }
@@ -672,19 +746,90 @@ String _xmlEsc(String s) => s
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;');
 
+class _PW {
+  final String text;
+  final double x0;
+  final double x1;
+  final double top;
+  final double bottom;
+  final double size;
+  final bool bold;
+  final bool italic;
+  final String family;
+  _PW(this.text, this.x0, this.x1, this.top, this.bottom, this.size, this.bold,
+      this.italic, this.family);
+  double get cy => (top + bottom) / 2;
+}
+
+String _family(String fontName) {
+  var f = fontName;
+  final plus = f.indexOf('+');
+  if (plus >= 0 && plus <= 7) f = f.substring(plus + 1);
+  f = f.split(RegExp(r'[-,]'))[0];
+  f = f.replaceAll(RegExp(r'(MT|PS)$'), '');
+  return f.isEmpty ? 'Arial' : f;
+}
+
+// Group words that sit on the same visual line
+List<List<_PW>> _clusterRows(List<_PW> words) {
+  final sorted = [...words]..sort((a, b) => a.cy.compareTo(b.cy));
+  final rows = <List<_PW>>[];
+  final cys = <double>[];
+  for (final w in sorted) {
+    if (rows.isNotEmpty) {
+      final tol = 0.45 * math.max(w.size, rows.last.first.size);
+      if ((w.cy - cys.last).abs() <= tol) {
+        rows.last.add(w);
+        var sum = 0.0;
+        for (final x in rows.last) {
+          sum += x.cy;
+        }
+        cys[cys.length - 1] = sum / rows.last.length;
+        continue;
+      }
+    }
+    rows.add([w]);
+    cys.add(w.cy);
+  }
+  return rows;
+}
+
 Future<File> pdfToDocx(String path, String name) async {
   final bytes = await File(path).readAsBytes();
   final sfDoc = sf.PdfDocument(inputBytes: bytes);
   final extractor = sf.PdfTextExtractor(sfDoc);
+  final pageW = sfDoc.pages[0].size.width;
+  final pageH = sfDoc.pages[0].size.height;
 
-  final pages = <List<String>>[];
+  final pages = <List<_PW>>[];
   var total = 0;
+  var minX = double.infinity;
   for (var i = 0; i < sfDoc.pages.count; i++) {
-    final t = extractor.extractText(startPageIndex: i, endPageIndex: i);
-    total += t.trim().length;
-    pages.add(
-      t.replaceAll('\r\n', '\n').split('\n').map((l) => l.trimRight()).toList(),
-    );
+    final ws = <_PW>[];
+    final lines = extractor.extractTextLines(startPageIndex: i, endPageIndex: i);
+    for (final line in lines) {
+      for (final w in line.wordCollection) {
+        final t = w.text.trim();
+        if (t.isEmpty) continue;
+        final b = w.bounds;
+        final fn = w.fontName;
+        final low = fn.toLowerCase();
+        ws.add(_PW(
+          t,
+          b.left,
+          b.right,
+          b.top,
+          b.bottom,
+          w.fontSize > 0 ? w.fontSize : 10,
+          low.contains('bold'),
+          low.contains('italic') || low.contains('oblique'),
+          _family(fn),
+        ));
+        total += t.length;
+        if (b.left < minX) minX = b.left;
+      }
+    }
+    pages.add(ws);
   }
   sfDoc.dispose();
 
@@ -693,14 +838,75 @@ Future<File> pdfToDocx(String path, String name) async {
         'Idhu scanned (image) PDF. Text illa, v1-la support illa.');
   }
 
+  final leftM = math.max(0.0, (minX.isFinite ? minX : 36.0) - 1);
+  const topM = 18.0;
+
   final body = StringBuffer();
-  for (var i = 0; i < pages.length; i++) {
-    for (final line in pages[i]) {
-      body.write(
-          '<w:p><w:r><w:t xml:space="preserve">${_xmlEsc(line)}</w:t></w:r></w:p>');
-    }
-    if (i < pages.length - 1) {
-      body.write('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
+  for (var pi = 0; pi < pages.length; pi++) {
+    final rows = _clusterRows(pages[pi]);
+    var first = true;
+    var prevTop = 0.0;
+    var prevLine = 0.0;
+    for (final row in rows) {
+      row.sort((a, b) => a.x0.compareTo(b.x0));
+      var size = 0.0;
+      var rowTop = double.infinity;
+      for (final w in row) {
+        if (w.size > size) size = w.size;
+        if (w.top < rowTop) rowTop = w.top;
+      }
+      final line = size * 1.2;
+      var before = first ? (rowTop - topM) : (rowTop - (prevTop + prevLine));
+      if (before < 0) before = 0;
+
+      // split into segments; a big gap = new column (tab stop)
+      final segs = <List<_PW>>[];
+      for (final w in row) {
+        if (segs.isNotEmpty && w.x0 - segs.last.last.x1 < size * 0.8) {
+          segs.last.add(w);
+        } else {
+          segs.add([w]);
+        }
+      }
+
+      final tabs = StringBuffer();
+      var lastPos = 0;
+      for (var si = 1; si < segs.length; si++) {
+        var pos = ((segs[si].first.x0 - leftM) * 20).round();
+        if (pos <= lastPos) pos = lastPos + 1;
+        lastPos = pos;
+        tabs.write('<w:tab w:val="left" w:pos="$pos"/>');
+      }
+      final indent = ((segs.first.first.x0 - leftM) * 20).round();
+
+      final pPr = StringBuffer('<w:pPr>');
+      if (first && pi > 0) pPr.write('<w:pageBreakBefore/>');
+      if (segs.length > 1) pPr.write('<w:tabs>$tabs</w:tabs>');
+      pPr.write('<w:spacing w:before="${(before * 20).round()}" w:after="0" '
+          'w:line="${(line * 20).round()}" w:lineRule="exact"/>');
+      if (indent > 0) pPr.write('<w:ind w:left="$indent"/>');
+      pPr.write('</w:pPr>');
+
+      final runs = StringBuffer();
+      for (var si = 0; si < segs.length; si++) {
+        if (si > 0) runs.write('<w:r><w:tab/></w:r>');
+        for (var wi = 0; wi < segs[si].length; wi++) {
+          final w = segs[si][wi];
+          final sp = wi < segs[si].length - 1 ? ' ' : '';
+          final fam = _xmlEsc(w.family);
+          final hs = (w.size * 2).round();
+          runs.write('<w:r><w:rPr>'
+              '<w:rFonts w:ascii="$fam" w:hAnsi="$fam" w:cs="$fam"/>'
+              '${w.bold ? '<w:b/>' : ''}${w.italic ? '<w:i/>' : ''}'
+              '<w:sz w:val="$hs"/><w:szCs w:val="$hs"/>'
+              '</w:rPr><w:t xml:space="preserve">${_xmlEsc(w.text)}$sp</w:t></w:r>');
+        }
+      }
+      body.write('<w:p>$pPr$runs</w:p>');
+
+      first = false;
+      prevTop = rowTop;
+      prevLine = line;
     }
   }
 
@@ -708,9 +914,9 @@ Future<File> pdfToDocx(String path, String name) async {
   final docXml = '$header'
       '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
       '<w:body>$body'
-      '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
-      '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" '
-      'w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>'
+      '<w:sectPr><w:pgSz w:w="${(pageW * 20).round()}" w:h="${(pageH * 20).round()}"/>'
+      '<w:pgMar w:top="${(topM * 20).round()}" w:right="360" w:bottom="360" '
+      'w:left="${(leftM * 20).round()}" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr>'
       '</w:body></w:document>';
 
   const contentTypes = '$header'
