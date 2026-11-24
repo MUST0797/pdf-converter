@@ -56,14 +56,21 @@ jobs:
 
       - run: flutter pub get
 
+      - name: Use Google Maven mirror instead of Maven Central (avoids 429)
+        run: |
+          M="https://maven-central.storage-download.googleapis.com/maven2/"
+          sed -i "s#mavenCentral()#maven { url = uri(\"$M\") }#g" android/settings.gradle.kts android/build.gradle.kts
+          find "$HOME/.pub-cache" -path '*android*' -name 'build.gradle' -exec sed -i "s#mavenCentral()#maven { url '$M' }#g" {} + || true
+          find "$HOME/.pub-cache" -path '*android*' -name 'build.gradle.kts' -exec sed -i "s#mavenCentral()#maven { url = uri(\"$M\") }#g" {} + || true
+          echo "--- settings.gradle.kts ---"
+          cat android/settings.gradle.kts
+
       - name: Build release APK
-        env:
-          GRADLE_OPTS: "-Dorg.gradle.internal.repository.max.retries=10 -Dorg.gradle.internal.repository.initial.backoff=3000"
         run: |
           for i in 1 2 3 4; do
             flutter build apk --release && exit 0
             echo "Build failed (attempt $i), waiting before retry..."
-            sleep 120
+            sleep 90
           done
           exit 1
 
