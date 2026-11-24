@@ -21,34 +21,14 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Gradle cache
-        uses: actions/cache@v4
+      - name: Restore Gradle cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('pubspec.yaml') }}
+          key: gradle-${{ hashFiles('pubspec.yaml') }}-${{ github.run_id }}
           restore-keys: gradle-
-
-      - name: Gradle mirror (avoids Maven 429 errors)
-        run: |
-          mkdir -p ~/.gradle
-          cat > ~/.gradle/init.gradle <<'EOF'
-          def mirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
-          beforeSettings { settings ->
-              settings.pluginManagement.repositories {
-                  maven { url mirror }
-              }
-          }
-          allprojects {
-              buildscript.repositories {
-                  maven { url mirror }
-              }
-              repositories {
-                  maven { url mirror }
-              }
-          }
-          EOF
 
       - name: Generate Android project files
         run: flutter create --platforms=android --org com.musthafa --project-name pdf_converter .
@@ -77,13 +57,24 @@ jobs:
       - run: flutter pub get
 
       - name: Build release APK
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.internal.repository.max.retries=10 -Dorg.gradle.internal.repository.initial.backoff=3000"
         run: |
           for i in 1 2 3 4; do
             flutter build apk --release && exit 0
             echo "Build failed (attempt $i), waiting before retry..."
-            sleep 60
+            sleep 120
           done
           exit 1
+
+      - name: Save Gradle cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('pubspec.yaml') }}-${{ github.run_id }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
