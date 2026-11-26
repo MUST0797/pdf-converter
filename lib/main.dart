@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -124,7 +125,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final result = await OpenFilex.open(file.path, type: mimeType);
     if (result.type != ResultType.done && context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Cannot open file: ${result.message}')),
+        SnackBar(content: Text('Open failed (${result.type}): ${result.message}')),
       );
     }
   }
@@ -182,6 +183,25 @@ class _HomeScreenState extends State<HomeScreen> {
     return buf.toString();
   }
 
+  // Prevents mojibake glyphs like Å° C, â€“ , Åµ in standard PDF fonts
+  String _normalizePdfSafeText(String input) {
+    return _cleanText(input)
+        .replaceAll('°', ' deg')
+        .replaceAll('µ', 'u')
+        .replaceAll('μ', 'u')
+        .replaceAll('–', '-')
+        .replaceAll('—', '-')
+        .replaceAll('−', '-')
+        .replaceAll('≤', '<=')
+        .replaceAll('≥', '>=')
+        .replaceAll('“', '"')
+        .replaceAll('”', '"')
+        .replaceAll('‘', "'")
+        .replaceAll('’', "'")
+        .replaceAll('\t', '   ')
+        .replaceAll(RegExp(r' +'), ' ');
+  }
+
   String _escapeXml(String input) {
     return _cleanText(input)
         .replaceAll('&', '&amp;')
@@ -191,7 +211,7 @@ class _HomeScreenState extends State<HomeScreen> {
         .replaceAll("'", '&apos;');
   }
 
-  List<String> _splitForMultiPage(String text, {int maxChars = 400}) {
+  List<String> _splitForMultiPage(String text, {int maxChars = 420}) {
     final clean = _cleanText(text).trim();
     if (clean.isEmpty) return ['(Empty document)'];
 
@@ -217,23 +237,86 @@ class _HomeScreenState extends State<HomeScreen> {
     return out;
   }
 
+  String _collectParagraphText(xml.XmlElement pElem) {
+    final buf = StringBuffer();
+    void walk(xml.XmlNode n) {
+      if (n is xml.XmlElement) {
+        final local = n.name.local;
+        if (local == 't') {
+          buf.write(n.innerText);
+        } else if (local == 'tab') {
+          buf.write('   ');
+        } else if (local == 'br' || local == 'cr') {
+          buf.write('\n');
+        }
+        for (final child in n.children) {
+          walk(child);
+        }
+      }
+    }
+
+    walk(pElem);
+    return buf.toString().trim();
+  }
+
+  String _collectCellText(xml.XmlElement tcElem) {
+    final cellLines = <String>[];
+    for (final p in tcElem.findAllElements('w:p')) {
+      final t = _collectParagraphText(p);
+      if (t.isNotEmpty) {
+        cellLines.add(t);
+      }
+    }
+    return cellLines.join(' ').trim();
+  }
+
+  // Preserves table rows (<w:tr>) as single joined lines and standard paragraphs (<w:p>)
   String _parseDocxXml(String xmlStr) {
     final cleaned = _cleanText(xmlStr);
     if (cleaned.trim().isEmpty) return '';
     try {
       final docXml = xml.XmlDocument.parse(cleaned);
       final lines = <String>[];
-      for (final p in docXml.findAllElements('w:p')) {
-        final t = p.findAllElements('w:t').map((e) => e.innerText).join().trim();
-        if (t.isNotEmpty) {
-          lines.add(t);
+
+      void walkBody(xml.XmlNode n) {
+        if (n is xml.XmlElement) {
+          final local = n.name.local;
+          if (local == 'tr') {
+            final rowCells = <String>[];
+            for (final child in n.children) {
+              if (child is xml.XmlElement && child.name.local == 'tc') {
+                final cellText = _collectCellText(child);
+                if (cellText.isNotEmpty) {
+                  rowCells.add(cellText);
+                }
+              }
+            }
+            if (rowCells.isNotEmpty) {
+              lines.add(rowCells.join('  |  '));
+            }
+            return;
+          }
+          if (local == 'p') {
+            final pText = _collectParagraphText(n);
+            if (pText.isNotEmpty) {
+              lines.add(pText);
+            }
+            return;
+          }
+        }
+        for (final child in n.children) {
+          walkBody(child);
         }
       }
-      return lines.join('\n');
+
+      walkBody(docXml);
+      return _normalizePdfSafeText(lines.join('\n'));
     } catch (_) {
       final matches =
           RegExp(r'<w:t[^>]*>(.*?)</w:t>', dotAll: true).allMatches(cleaned);
-      return matches.map((m) => m.group(1) ?? '').join(' ').trim();
+      return _normalizePdfSafeText(
+        matches.map((m) => m.group(1) ?? '').join(' ').trim(),
+      );
     }
   }
 
@@ -309,7 +392,10 @@ class _HomeScreenState extends State<HomeScreen> {
     if (res == null || res.files.single.path == null) return;
 
     await _runTask(context, 'Converting TXT to PDF...', () async {
-      final content = await File(res.files.single.path!).readAsString();
+      final rawBytes = await File(res.files.single.path!).readAsBytes();
+      final content = _normalizePdfSafeText(
+        utf8.decode(rawBytes, allowMalformed: true),
+      );
       final chunks = _splitForMultiPage(content, maxChars: 550);
       final doc = pw.Document();
       doc.addPage(
@@ -320,7 +406,7 @@ class _HomeScreenState extends State<HomeScreen> {
               .map(
                 (line) => pw.Padding(
                   padding: const pw.EdgeInsets.only(bottom: 3),
-                  child: pw.Text(line, style: const pw.TextStyle(fontSize: 11)),
+                  child: pw.Text(line, style: const pw.TextStyle(fontSize: 10.5)),
                 ),
               )
               .toList(),
@@ -335,7 +421,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // 4) DOCX -> PDF (Header -> Body -> Footer order)
+  // 4) DOCX -> PDF (Header -> Body -> Footer order + clean symbols + table rows)
   Future<void> _docxToPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -351,8 +437,10 @@ class _HomeScreenState extends State<HomeScreen> {
         final f = archive.findFile(name);
         if (f == null) return '';
         final raw = f.content;
-        final bytes = raw is List<int> ? raw : (raw as Uint8List).toList();
-        return _parseDocxXml(String.fromCharCodes(bytes));
+        final bytes = raw is Uint8List
+            ? raw
+            : Uint8List.fromList((raw as List<int>));
+        return _parseDocxXml(utf8.decode(bytes, allowMalformed: true));
       }
 
       final headers = archive.files
@@ -383,7 +471,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final finalText =
           combined.trim().isEmpty ? '(No text found in DOCX)' : combined;
-      final chunks = _splitForMultiPage(finalText, maxChars: 400);
+      final chunks = _splitForMultiPage(finalText, maxChars: 420);
 
       final doc = pw.Document();
       doc.addPage(
@@ -394,7 +482,10 @@ class _HomeScreenState extends State<HomeScreen> {
               .map(
                 (line) => pw.Padding(
                   padding: const pw.EdgeInsets.only(bottom: 4),
-                  child: pw.Text(line, style: const pw.TextStyle(fontSize: 11)),
+                  child: pw.Text(
+                    line,
+                    style: const pw.TextStyle(fontSize: 10.5),
+                  ),
                 ),
               )
               .toList(),
@@ -456,28 +547,14 @@ class _HomeScreenState extends State<HomeScreen> {
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>''';
 
+      final docBytes = utf8.encode(documentXml);
+      final ctBytes = utf8.encode(contentTypesXml);
+      final relBytes = utf8.encode(relsXml);
+
       final archive = Archive()
-        ..addFile(
-          ArchiveFile(
-            '[Content_Types].xml',
-            contentTypesXml.length,
-            contentTypesXml.codeUnits,
-          ),
-        )
-        ..addFile(
-          ArchiveFile(
-            '_rels/.rels',
-            relsXml.length,
-            relsXml.codeUnits,
-          ),
-        )
-        ..addFile(
-          ArchiveFile(
-            'word/document.xml',
-            documentXml.length,
-            documentXml.codeUnits,
-          ),
-        );
+        ..addFile(ArchiveFile('[Content_Types].xml', ctBytes.length, ctBytes))
+        ..addFile(ArchiveFile('_rels/.rels', relBytes.length, relBytes))
+        ..addFile(ArchiveFile('word/document.xml', docBytes.length, docBytes));
 
       final zipBytes = ZipEncoder().encode(archive) ?? <int>[];
       final out = await _saveOutputFile(
