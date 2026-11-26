@@ -489,4 +489,530 @@ class _PdfToImageScreenState extends State<PdfToImageScreen> {
                               const SizedBox(height: 10),
                               Text(
                                 _convertedPages > 0
-                                    
+                                    ? 'Converting page $_convertedPages...'
+                                    : 'Preparing pages...',
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed:
+                    (_pdfPath == null || _busy) ? null : _openOptionsAndConvert,
+                icon: _busy
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.tune),
+                label: Text(_busy
+                    ? 'Converting ($_convertedPages)...'
+                    : 'Choose Format & Quality'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------- Image Result ----------
+
+class ImageResultScreen extends StatelessWidget {
+  final List<File> files;
+  final String formatLabel;
+  final String qualityLabel;
+
+  const ImageResultScreen({
+    super.key,
+    required this.files,
+    required this.formatLabel,
+    required this.qualityLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Converted (${files.length})'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.share),
+            tooltip: 'Share All',
+            onPressed: () => Share.shareXFiles(
+              files.map((f) => XFile(f.path)).toList(),
+            ),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('$formatLabel • $qualityLabel',
+                    style: const TextStyle(fontWeight: FontWeight.w600)),
+                TextButton.icon(
+                  onPressed: () => Navigator.pushReplacement(
+                    context,
+                    MaterialPageRoute(builder: (_) => const MyFilesScreen()),
+                  ),
+                  icon: const Icon(Icons.folder, size: 18),
+                  label: const Text('My Files'),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: GridView.builder(
+              padding: const EdgeInsets.all(12),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                mainAxisSpacing: 12,
+                crossAxisSpacing: 12,
+                childAspectRatio: 0.75,
+              ),
+              itemCount: files.length,
+              itemBuilder: (_, i) {
+                final f = files[i];
+                return Card(
+                  clipBehavior: Clip.antiAlias,
+                  child: Column(
+                    children: [
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => OpenFilex.open(f.path),
+                          child: Image.file(
+                            f,
+                            width: double.infinity,
+                            fit: BoxFit.cover,
+                          ),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 4),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text('Page ${i + 1}',
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w600)),
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  icon: const Icon(Icons.open_in_new, size: 20),
+                                  onPressed: () => OpenFilex.open(f.path),
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.share, size: 20),
+                                  onPressed: () =>
+                                      Share.shareXFiles([XFile(f.path)]),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- Image -> PDF ----------
+
+class ImageToPdfScreen extends StatefulWidget {
+  const ImageToPdfScreen({super.key});
+
+  @override
+  State<ImageToPdfScreen> createState() => _ImageToPdfScreenState();
+}
+
+class _ImageToPdfScreenState extends State<ImageToPdfScreen> {
+  final List<String> _paths = [];
+  bool _busy = false;
+
+  Future<void> _pick() async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif'],
+      allowMultiple: true,
+    );
+    if (res == null) return;
+    setState(() {
+      for (final f in res.files) {
+        if (f.path != null) _paths.add(f.path!);
+      }
+    });
+  }
+
+  Future<void> _convert() async {
+    setState(() => _busy = true);
+    try {
+      final file = await imagesToPdf(_paths);
+      if (!mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => ResultScreen(file: file)),
+      );
+    } catch (e) {
+      if (mounted) snack(context, 'Convert aagala: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Image → PDF')),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _busy ? null : _pick,
+        icon: const Icon(Icons.add_photo_alternate),
+        label: const Text('Add images'),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: _paths.isEmpty
+                ? const Center(child: Text('Images select pannunga'))
+                : ReorderableListView.builder(
+                    itemCount: _paths.length,
+                    onReorder: (o, n) {
+                      setState(() {
+                        if (n > o) n--;
+                        _paths.insert(n, _paths.removeAt(o));
+                      });
+                    },
+                    itemBuilder: (_, i) => ListTile(
+                      key: ValueKey('${_paths[i]}_$i'),
+                      leading: Image.file(File(_paths[i]),
+                          width: 48, height: 48, fit: BoxFit.cover),
+                      title: Text(_paths[i].split('/').last,
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                      subtitle: Text('Page ${i + 1}'),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => setState(() => _paths.removeAt(i)),
+                      ),
+                    ),
+                  ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
+              child: SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: (_paths.isEmpty || _busy) ? null : _convert,
+                  icon: _busy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.picture_as_pdf),
+                  label: Text(_busy ? 'Converting...' : 'Convert to PDF'),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- TXT -> PDF ----------
+
+class TxtToPdfScreen extends StatefulWidget {
+  const TxtToPdfScreen({super.key});
+
+  @override
+  State<TxtToPdfScreen> createState() => _TxtToPdfScreenState();
+}
+
+class _TxtToPdfScreenState extends State<TxtToPdfScreen> {
+  String? _name;
+  String? _text;
+  bool _busy = false;
+
+  Future<void> _pick() async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['txt'],
+    );
+    if (res == null || res.files.single.path == null) return;
+    final path = res.files.single.path!;
+    final bytes = await File(path).readAsBytes();
+    setState(() {
+      _name = res.files.single.name;
+      _text = utf8.decode(bytes, allowMalformed: true);
+    });
+  }
+
+  Future<void> _convert() async {
+    setState(() => _busy = true);
+    try {
+      final base =
+          _name!.replaceAll(RegExp(r'\.txt$', caseSensitive: false), '');
+      final file = await textToPdf(_text!, base);
+      if (!mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => ResultScreen(file: file)),
+      );
+    } catch (e) {
+      if (mounted) snack(context, 'Convert aagala: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final preview = (_text ?? '');
+    return Scaffold(
+      appBar: AppBar(title: const Text('TXT → PDF')),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _busy ? null : _pick,
+        icon: const Icon(Icons.text_snippet),
+        label: const Text('Select TXT file'),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: _text == null
+                ? const Center(child: Text('TXT file select pannunga'))
+                : Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(_name!,
+                            style: const TextStyle(
+                                fontWeight: FontWeight.w600, fontSize: 16)),
+                        const SizedBox(height: 4),
+                        Text('${_text!.length} characters'),
+                        const Divider(height: 24),
+                        Expanded(
+                          child: SingleChildScrollView(
+                            child: Text(
+                              preview.length > 1500
+                                  ? '${preview.substring(0, 1500)}...'
+                                  : preview,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
+              child: SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: (_text == null || _busy) ? null : _convert,
+                  icon: _busy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.picture_as_pdf),
+                  label: Text(_busy ? 'Converting...' : 'Convert to PDF'),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- Result ----------
+
+class ResultScreen extends StatelessWidget {
+  final File file;
+  const ResultScreen({super.key, required this.file});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Done')),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.check_circle, size: 80, color: Colors.green),
+            const SizedBox(height: 16),
+            Text(file.path.split('/').last, textAlign: TextAlign.center),
+            const SizedBox(height: 32),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: () => OpenFilex.open(file.path),
+                icon: const Icon(Icons.open_in_new),
+                label: const Text('Open'),
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => Share.shareXFiles([XFile(file.path)]),
+                icon: const Icon(Icons.share),
+                label: const Text('Share'),
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: TextButton.icon(
+                onPressed: () => Navigator.pushReplacement(
+                  context,
+                  MaterialPageRoute(builder: (_) => const MyFilesScreen()),
+                ),
+                icon: const Icon(Icons.folder),
+                label: const Text('My Files'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------- My Files ----------
+
+class MyFilesScreen extends StatefulWidget {
+  const MyFilesScreen({super.key});
+
+  @override
+  State<MyFilesScreen> createState() => _MyFilesScreenState();
+}
+
+class _MyFilesScreenState extends State<MyFilesScreen> {
+  List<File> _files = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final dir = await pdfDir();
+    final list = dir
+        .listSync()
+        .whereType<File>()
+        .where((f) {
+          final p = f.path.toLowerCase();
+          return p.endsWith('.pdf') ||
+              p.endsWith('.docx') ||
+              p.endsWith('.png') ||
+              p.endsWith('.jpg') ||
+              p.endsWith('.jpeg');
+        })
+        .toList()
+      ..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+    if (!mounted) return;
+    setState(() {
+      _files = list;
+      _loading = false;
+    });
+  }
+
+  Future<void> _delete(File f) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Delete pannattuma?'),
+        content: Text(f.path.split('/').last),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await f.delete();
+      _load();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('My Files')),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _files.isEmpty
+              ? const Center(child: Text('Innum files illa'))
+              : ListView.builder(
+                  itemCount: _files.length,
+                  itemBuilder: (_, i) {
+                    final f = _files[i];
+                    final lower = f.path.toLowerCase();
+                    final isPdf = lower.endsWith('.pdf');
+                    final isImage = lower.endsWith('.png') ||
+                        lower.endsWith('.jpg') ||
+                        lower.endsWith('.jpeg');
+                    final kb = (f.lengthSync() / 1024).toStringAsFixed(0);
+                    return ListTile(
+                      leading: isImage
+                          ? Image.file(f,
+                              width: 40, height: 40, fit: BoxFit.cover)
+                          : Icon(
+                              isPdf
+                                  ? Icons.picture_as_pdf
+                                  : Icons.description,
+                              color: isPdf ? Colors.red : Colors.blue),
+                      title: Text(f.path.split('/').last,
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                      subtitle: Text('$kb KB'),
+                      onTap: () => OpenFilex.open(f.path),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.share),
+                            onPressed: () => Share.shareXFiles([XFile(f.path)]),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline),
+                            onPressed: () => _delete(f),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+    );
+  }
+}
