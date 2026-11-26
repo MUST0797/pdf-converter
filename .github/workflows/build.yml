@@ -100,3 +100,40 @@ jobs:
 
       - name: Set Android app name
         run: |
+          python3 -c '
+          import pathlib, re
+          p = pathlib.Path("android/app/src/main/AndroidManifest.xml")
+          txt = p.read_text(encoding="utf-8")
+          txt = re.sub(r'\''android:label="[^"]*"'\'', '\''android:label="PDF Converter Team"'\'', txt, count=1)
+          p.write_text(txt, encoding="utf-8")
+          '
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Build release APK
+        run: |
+          for i in 1 2 3 4; do
+            flutter build apk --release && exit 0
+            echo "Build failed (attempt $i), waiting before retry..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Save Gradle cache
+        if: success() && steps.cache-gradle.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('pubspec.yaml', '**/gradle-wrapper.properties') }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
