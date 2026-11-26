@@ -286,6 +286,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return lines.join(' ').trim();
   }
 
+  // Compacts empty merged cells so rows keep their true logical columns
   List<_DocxBlock> _parseDocxBlocks(String xmlStr) {
     final cleaned = _cleanText(xmlStr);
     if (cleaned.trim().isEmpty) return const [];
@@ -299,29 +300,24 @@ class _HomeScreenState extends State<HomeScreen> {
           final local = n.name.local;
           if (local == 'tbl') {
             final rows = <List<String>>[];
-            int maxCols = 0;
             for (final child in n.children) {
               if (child is xml.XmlElement && child.name.local == 'tr') {
-                final rawCells = <String>[];
+                final cells = <String>[];
                 for (final trChild in child.children) {
                   if (trChild is xml.XmlElement && trChild.name.local == 'tc') {
-                    rawCells.add(_collectCellText(trChild));
+                    final txt = _collectCellText(trChild);
+                    if (txt.isNotEmpty) {
+                      cells.add(txt);
+                    }
                   }
                 }
-                if (rawCells.any((c) => c.isNotEmpty)) {
-                  if (rawCells.length > maxCols) maxCols = rawCells.length;
-                  rows.add(rawCells);
+                if (cells.isNotEmpty) {
+                  rows.add(cells);
                 }
               }
             }
-            if (rows.isNotEmpty && maxCols > 0) {
-              final normalizedRows = rows
-                  .map((r) => List<String>.generate(
-                        maxCols,
-                        (idx) => idx < r.length ? r[idx] : '',
-                      ))
-                  .toList();
-              blocks.add(_DocxBlock.table(normalizedRows));
+            if (rows.isNotEmpty) {
+              blocks.add(_DocxBlock.table(rows));
             }
             return;
           }
@@ -369,59 +365,68 @@ class _HomeScreenState extends State<HomeScreen> {
     return lines.join('\n').trim();
   }
 
-  Map<int, pw.TableColumnWidth> _columnWidthsForRows(
-    List<List<String>> rows,
-    int colCount,
-  ) {
-    final isChecklist5Col = colCount == 5 &&
-        rows.any((r) =>
-            r.any((c) => c.toUpperCase().contains('S. NO')) ||
-            r.any((c) => c.toUpperCase().contains('INSTRUMENTS')) ||
-            RegExp(r'^\d+$').hasMatch(r.first.trim()));
-
-    if (isChecklist5Col) {
-      return {
-        0: const pw.FixedColumnWidth(32),
-        1: const pw.FlexColumnWidth(2.5),
-        2: const pw.FixedColumnWidth(42),
-        3: const pw.FlexColumnWidth(1.3),
-        4: const pw.FlexColumnWidth(1.1),
-      };
-    }
-
-    if (colCount == 2) {
-      return {
-        0: const pw.FlexColumnWidth(1.6),
-        1: const pw.FlexColumnWidth(2.4),
-      };
-    }
-
-    if (colCount == 3) {
-      return {
-        0: const pw.FlexColumnWidth(1.6),
-        1: const pw.FlexColumnWidth(1.6),
-        2: const pw.FlexColumnWidth(1.2),
-      };
-    }
-
-    final map = <int, pw.TableColumnWidth>{};
-    for (int c = 0; c < colCount; c++) {
-      map[c] = const pw.FlexColumnWidth();
-    }
-    return map;
+  pw.Widget _buildSingleRowTable(
+    List<String> cells,
+    Map<int, pw.TableColumnWidth> widths, {
+    pw_pdf.PdfColor? bgColor,
+    bool bold = false,
+    double fontSize = 8.5,
+  }) {
+    return pw.Table(
+      border: pw.TableBorder.all(color: pw_pdf.PdfColors.grey600, width: 0.6),
+      columnWidths: widths,
+      children: [
+        pw.TableRow(
+          decoration: bgColor != null ? pw.BoxDecoration(color: bgColor) : null,
+          children: cells
+              .map(
+                (c) => pw.Padding(
+                  padding: const pw.EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 4,
+                  ),
+                  child: pw.Text(
+                    c,
+                    style: pw.TextStyle(
+                      fontSize: fontSize,
+                      fontWeight:
+                          bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+                    ),
+                  ),
+                ),
+              )
+              .toList(),
+        ),
+      ],
+    );
   }
 
   List<pw.Widget> _buildPdfWidgetsFromBlocks(List<_DocxBlock> blocks) {
     final widgets = <pw.Widget>[];
+
     for (final b in blocks) {
       if (b.type == _DocxBlockType.paragraph && b.text != null) {
-        for (final chunk in _splitForMultiPage(b.text!, maxChars: 380)) {
+        final txt = b.text!.trim();
+        final isTitle = txt.toUpperCase().contains('PREVENTIVE MAINTENANCE');
+        for (final chunk in _splitForMultiPage(txt, maxChars: 380)) {
           widgets.add(
-            pw.Padding(
-              padding: const pw.EdgeInsets.only(bottom: 4),
+            pw.Container(
+              width: double.infinity,
+              margin: const pw.EdgeInsets.only(bottom: 4),
+              padding: isTitle
+                  ? const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 6)
+                  : pw.EdgeInsets.zero,
+              decoration: isTitle
+                  ? const pw.BoxDecoration(color: pw_pdf.PdfColors.blue200)
+                  : null,
               child: pw.Text(
                 chunk,
-                style: const pw.TextStyle(fontSize: 9.5),
+                textAlign: isTitle ? pw.TextAlign.center : pw.TextAlign.left,
+                style: pw.TextStyle(
+                  fontSize: isTitle ? 10.5 : 9.5,
+                  fontWeight:
+                      isTitle ? pw.FontWeight.bold : pw.FontWeight.normal,
+                ),
               ),
             ),
           );
@@ -429,47 +434,41 @@ class _HomeScreenState extends State<HomeScreen> {
       } else if (b.type == _DocxBlockType.table &&
           b.rows != null &&
           b.rows!.isNotEmpty) {
-        // Group consecutive rows with same column count so mixed tables don't force narrow cols
-        final groups = <List<List<String>>>[];
-        for (final row in b.rows!) {
-          if (groups.isEmpty || groups.last.first.length != row.length) {
-            groups.add([row]);
-          } else {
-            groups.last.add(row);
-          }
-        }
+        final checklistRows = <List<String>>[];
 
-        for (final groupRows in groups) {
-          final colCount = groupRows.first.length;
-          final colWidths = _columnWidthsForRows(groupRows, colCount);
-
-          for (int start = 0; start < groupRows.length; start += 16) {
-            final end = (start + 16 < groupRows.length)
+        void flushChecklist() {
+          if (checklistRows.isEmpty) return;
+          final widths = <int, pw.TableColumnWidth>{
+            0: const pw.FixedColumnWidth(32),
+            1: const pw.FlexColumnWidth(2.6),
+            2: const pw.FixedColumnWidth(44),
+            3: const pw.FlexColumnWidth(1.3),
+            4: const pw.FlexColumnWidth(1.1),
+          };
+          for (int start = 0; start < checklistRows.length; start += 16) {
+            final end = (start + 16 < checklistRows.length)
                 ? start + 16
-                : groupRows.length;
-            final subRows = groupRows.sublist(start, end);
-
+                : checklistRows.length;
+            final sub = checklistRows.sublist(start, end);
             widgets.add(
               pw.Table(
                 border: pw.TableBorder.all(
                   color: pw_pdf.PdfColors.grey600,
                   width: 0.6,
                 ),
-                columnWidths: colWidths,
-                children: subRows.map((row) {
-                  final joinedUpper = row.join(' ').toUpperCase();
-                  final isBannerRow =
-                      joinedUpper.contains('PREVENTIVE MAINTENANCE');
-                  final isHeaderRow = joinedUpper.contains('S. NO') ||
-                      joinedUpper.contains('INSTRUMENTS') ||
-                      joinedUpper.contains('NORMAL PARAMETERS');
+                columnWidths: widths,
+                children: sub.map((r) {
+                  final normalized = List<String>.generate(
+                    5,
+                    (i) => i < r.length ? r[i] : '',
+                  );
+                  final isHead = normalized.join(' ').toUpperCase().contains('S. NO') ||
+                      normalized.join(' ').toUpperCase().contains('INSTRUMENTS');
                   return pw.TableRow(
-                    decoration: (isBannerRow || isHeaderRow)
-                        ? const pw.BoxDecoration(
-                            color: pw_pdf.PdfColors.blue100,
-                          )
+                    decoration: isHead
+                        ? const pw.BoxDecoration(color: pw_pdf.PdfColors.blue100)
                         : null,
-                    children: row
+                    children: normalized
                         .map(
                           (cell) => pw.Padding(
                             padding: const pw.EdgeInsets.symmetric(
@@ -480,7 +479,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               cell,
                               style: pw.TextStyle(
                                 fontSize: 8.5,
-                                fontWeight: (isBannerRow || isHeaderRow)
+                                fontWeight: isHead
                                     ? pw.FontWeight.bold
                                     : pw.FontWeight.normal,
                               ),
@@ -493,9 +492,101 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             );
           }
+          checklistRows.clear();
         }
+
+        for (final rawRow in b.rows!) {
+          final cells = rawRow.map((e) => e.trim()).toList();
+          final joinedUpper = cells.join(' ').toUpperCase();
+
+          final isChecklistCandidate = cells.length == 5 ||
+              joinedUpper.contains('S. NO') ||
+              joinedUpper.contains('INSTRUMENTS') ||
+              RegExp(r'^\d+$').hasMatch(cells.first);
+
+          if (isChecklistCandidate) {
+            checklistRows.add(cells);
+            continue;
+          }
+
+          flushChecklist();
+
+          if (cells.length == 1) {
+            final isBanner = joinedUpper.contains('PREVENTIVE MAINTENANCE');
+            widgets.add(
+              pw.Container(
+                width: double.infinity,
+                padding: const pw.EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 5,
+                ),
+                decoration: pw.BoxDecoration(
+                  color: isBanner
+                      ? pw_pdf.PdfColors.blue200
+                      : pw_pdf.PdfColors.grey100,
+                  border: pw.Border.all(
+                    color: pw_pdf.PdfColors.grey600,
+                    width: 0.6,
+                  ),
+                ),
+                child: pw.Text(
+                  cells.first,
+                  textAlign: isBanner ? pw.TextAlign.center : pw.TextAlign.left,
+                  style: pw.TextStyle(
+                    fontSize: isBanner ? 10 : 8.8,
+                    fontWeight:
+                        isBanner ? pw.FontWeight.bold : pw.FontWeight.normal,
+                  ),
+                ),
+              ),
+            );
+          } else if (cells.length == 2) {
+            widgets.add(
+              _buildSingleRowTable(
+                cells,
+                {
+                  0: const pw.FixedColumnWidth(135),
+                  1: const pw.FlexColumnWidth(),
+                },
+                bold: cells[0].endsWith(':'),
+              ),
+            );
+          } else if (cells.length == 3) {
+            final isAfcHeader = joinedUpper.contains('AFC') ||
+                joinedUpper.contains('NORMAL PARAMETERS');
+            final isSignOff = joinedUpper.contains('NUCTECH ENGINEER') ||
+                joinedUpper.contains('CUSTOMS');
+            widgets.add(
+              _buildSingleRowTable(
+                cells,
+                {
+                  0: isSignOff
+                      ? const pw.FlexColumnWidth(1.2)
+                      : const pw.FixedColumnWidth(155),
+                  1: const pw.FlexColumnWidth(1.5),
+                  2: isSignOff
+                      ? const pw.FlexColumnWidth(1.3)
+                      : const pw.FixedColumnWidth(95),
+                },
+                bgColor: isAfcHeader
+                    ? pw_pdf.PdfColors.blue100
+                    : (isSignOff ? pw_pdf.PdfColors.blue50 : null),
+                bold: isAfcHeader || isSignOff,
+              ),
+            );
+          } else {
+            final map = <int, pw.TableColumnWidth>{};
+            for (int i = 0; i < cells.length; i++) {
+              map[i] = const pw.FlexColumnWidth();
+            }
+            widgets.add(_buildSingleRowTable(cells, map));
+          }
+        }
+
+        flushChecklist();
       }
     }
+
     return widgets;
   }
 
@@ -600,7 +691,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // 4) DOCX -> PDF (Header, Body with Table Columns, and Footer)
+  // 4) DOCX -> PDF (Clean Original Layout)
   Future<void> _docxToPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -658,7 +749,7 @@ class _HomeScreenState extends State<HomeScreen> {
           pageFormat: pw_pdf.PdfPageFormat.a4,
           margin: const pw.EdgeInsets.all(20),
           header: (_) => pw.Container(
-            padding: const pw.EdgeInsets.only(bottom: 6),
+            padding: const pw.EdgeInsets.only(bottom: 5),
             margin: const pw.EdgeInsets.only(bottom: 8),
             decoration: const pw.BoxDecoration(
               border: pw.Border(
@@ -668,24 +759,17 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
-            child: pw.Row(
-              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-              children: [
-                pw.Expanded(
-                  child: pw.Text(
-                    headerDisplay,
-                    style: pw.TextStyle(
-                      fontSize: 9,
-                      fontWeight: pw.FontWeight.bold,
-                      color: pw_pdf.PdfColors.blue900,
-                    ),
-                  ),
-                ),
-              ],
+            child: pw.Text(
+              headerDisplay,
+              style: pw.TextStyle(
+                fontSize: 9,
+                fontWeight: pw.FontWeight.bold,
+                color: pw_pdf.PdfColors.blue900,
+              ),
             ),
           ),
           footer: (ctx) => pw.Container(
-            padding: const pw.EdgeInsets.only(top: 6),
+            padding: const pw.EdgeInsets.only(top: 5),
             margin: const pw.EdgeInsets.only(top: 8),
             decoration: const pw.BoxDecoration(
               border: pw.Border(
