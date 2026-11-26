@@ -374,7 +374,7 @@ class _HomeScreenState extends State<HomeScreen> {
     Map<int, pw.TableColumnWidth> widths, {
     pw_pdf.PdfColor? bgColor,
     bool bold = false,
-    double fontSize = 8.5,
+    double fontSize = 8.0,
   }) {
     return pw.Table(
       border: pw.TableBorder.all(color: pw_pdf.PdfColors.grey600, width: 0.6),
@@ -386,8 +386,8 @@ class _HomeScreenState extends State<HomeScreen> {
               .map(
                 (c) => pw.Padding(
                   padding: const pw.EdgeInsets.symmetric(
-                    horizontal: 6,
-                    vertical: 4,
+                    horizontal: 5,
+                    vertical: 2.5,
                   ),
                   child: pw.Text(
                     c,
@@ -416,9 +416,9 @@ class _HomeScreenState extends State<HomeScreen> {
           widgets.add(
             pw.Container(
               width: double.infinity,
-              margin: const pw.EdgeInsets.only(bottom: 4),
+              margin: const pw.EdgeInsets.only(bottom: 3),
               padding: isTitle
-                  ? const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 6)
+                  ? const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 4)
                   : pw.EdgeInsets.zero,
               decoration: isTitle
                   ? const pw.BoxDecoration(color: pw_pdf.PdfColors.blue200)
@@ -427,7 +427,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 chunk,
                 textAlign: isTitle ? pw.TextAlign.center : pw.TextAlign.left,
                 style: pw.TextStyle(
-                  fontSize: isTitle ? 10.5 : 9.5,
+                  fontSize: isTitle ? 9.5 : 8.5,
                   fontWeight:
                       isTitle ? pw.FontWeight.bold : pw.FontWeight.normal,
                 ),
@@ -443,15 +443,15 @@ class _HomeScreenState extends State<HomeScreen> {
         void flushChecklist() {
           if (checklistRows.isEmpty) return;
           final widths = <int, pw.TableColumnWidth>{
-            0: const pw.FixedColumnWidth(32),
+            0: const pw.FixedColumnWidth(30),
             1: const pw.FlexColumnWidth(2.6),
-            2: const pw.FixedColumnWidth(44),
+            2: const pw.FixedColumnWidth(42),
             3: const pw.FlexColumnWidth(1.3),
             4: const pw.FlexColumnWidth(1.1),
           };
-          for (int start = 0; start < checklistRows.length; start += 16) {
-            final end = (start + 16 < checklistRows.length)
-                ? start + 16
+          for (int start = 0; start < checklistRows.length; start += 30) {
+            final end = (start + 30 < checklistRows.length)
+                ? start + 30
                 : checklistRows.length;
             final sub = checklistRows.sublist(start, end);
             widgets.add(
@@ -480,13 +480,13 @@ class _HomeScreenState extends State<HomeScreen> {
                         .map(
                           (cell) => pw.Padding(
                             padding: const pw.EdgeInsets.symmetric(
-                              horizontal: 5,
-                              vertical: 3.5,
+                              horizontal: 4,
+                              vertical: 2.0,
                             ),
                             child: pw.Text(
                               cell,
                               style: pw.TextStyle(
-                                fontSize: 8.5,
+                                fontSize: 7.8,
                                 fontWeight: isHead
                                     ? pw.FontWeight.bold
                                     : pw.FontWeight.normal,
@@ -525,8 +525,8 @@ class _HomeScreenState extends State<HomeScreen> {
               pw.Container(
                 width: double.infinity,
                 padding: const pw.EdgeInsets.symmetric(
-                  horizontal: 8,
-                  vertical: 5,
+                  horizontal: 6,
+                  vertical: 3.5,
                 ),
                 decoration: pw.BoxDecoration(
                   color: isBanner
@@ -541,7 +541,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   cells.first,
                   textAlign: isBanner ? pw.TextAlign.center : pw.TextAlign.left,
                   style: pw.TextStyle(
-                    fontSize: isBanner ? 10 : 8.8,
+                    fontSize: isBanner ? 9.5 : 8.2,
                     fontWeight:
                         isBanner ? pw.FontWeight.bold : pw.FontWeight.normal,
                   ),
@@ -772,19 +772,19 @@ class _HomeScreenState extends State<HomeScreen> {
       doc.addPage(
         pw.MultiPage(
           pageFormat: pw_pdf.PdfPageFormat.a4,
-          margin: const pw.EdgeInsets.all(20),
+          margin: const pw.EdgeInsets.fromLTRB(18, 14, 18, 14),
           header: (_) => pw.Column(
             crossAxisAlignment: pw.CrossAxisAlignment.stretch,
             children: [
               if (topBannerImages.isNotEmpty)
                 pw.Padding(
-                  padding: const pw.EdgeInsets.only(bottom: 4),
+                  padding: const pw.EdgeInsets.only(bottom: 3),
                   child: pw.Row(
                     mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
                     children: topBannerImages
                         .map(
                           (img) => pw.SizedBox(
-                            height: 28,
+                            height: 22,
                             child: pw.Image(img, fit: pw.BoxFit.contain),
                           ),
                         )
@@ -792,20 +792,20 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               pw.Container(
-                padding: const pw.EdgeInsets.only(bottom: 5),
-                margin: const pw.EdgeInsets.only(bottom: 8),
+                padding: const pw.EdgeInsets.only(bottom: 3),
+                margin: const pw.EdgeInsets.only(bottom: 5),
                 decoration: const pw.BoxDecoration(
                   border: pw.Border(
                     bottom: pw.BorderSide(
                       color: pw_pdf.PdfColors.grey600,
-                      width: 0.8,
+                      width: 0.7,
                     ),
                   ),
                 ),
                 child: pw.Text(
                   headerDisplay,
                   style: pw.TextStyle(
-                    fontSize: 9,
+                    fontSize: 8.5,
                     fontWeight: pw.FontWeight.bold,
                     color: pw_pdf.PdfColors.blue900,
                   ),
@@ -814,13 +814,13 @@ class _HomeScreenState extends State<HomeScreen> {
             ],
           ),
           footer: (ctx) => pw.Container(
-            padding: const pw.EdgeInsets.only(top: 5),
-            margin: const pw.EdgeInsets.only(top: 8),
+            padding: const pw.EdgeInsets.only(top: 4),
+            margin: const pw.EdgeInsets.only(top: 5),
             decoration: const pw.BoxDecoration(
               border: pw.Border(
                 top: pw.BorderSide(
                   color: pw_pdf.PdfColors.grey600,
-                  width: 0.8,
+                  width: 0.7,
                 ),
               ),
             ),
@@ -831,7 +831,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: pw.Text(
                     footerDisplay,
                     style: const pw.TextStyle(
-                      fontSize: 7.5,
+                      fontSize: 7.0,
                       color: pw_pdf.PdfColors.grey800,
                     ),
                   ),
@@ -840,7 +840,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 pw.Text(
                   'Page ${ctx.pageNumber}/${ctx.pagesCount}',
                   style: const pw.TextStyle(
-                    fontSize: 7.5,
+                    fontSize: 7.0,
                     color: pw_pdf.PdfColors.grey700,
                   ),
                 ),
