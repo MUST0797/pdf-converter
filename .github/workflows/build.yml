@@ -98,6 +98,16 @@ jobs:
           cat /tmp/patch.kts android/build.gradle.kts > /tmp/new.kts
           mv /tmp/new.kts android/build.gradle.kts
 
+      - name: Set Android app name
+        run: |
+          python3 -c '
+          import pathlib, re
+          p = pathlib.Path("android/app/src/main/AndroidManifest.xml")
+          txt = p.read_text(encoding="utf-8")
+          txt = re.sub(r'\''android:label="[^"]*"'\'', '\''android:label="PDF Converter Team"'\'', txt, count=1)
+          p.write_text(txt, encoding="utf-8")
+          '
+
       - run: flutter pub get
 
       - name: Build release APK
