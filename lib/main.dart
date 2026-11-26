@@ -106,6 +106,33 @@ class _HomeScreenState extends State<HomeScreen> {
     return file;
   }
 
+  Future<void> _openSavedFile(BuildContext context, File file) async {
+    if (!await file.exists()) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Output file not found')),
+        );
+      }
+      return;
+    }
+    final lower = file.path.toLowerCase();
+    String? mimeType;
+    if (lower.endsWith('.pdf')) {
+      mimeType = 'application/pdf';
+    } else if (lower.endsWith('.docx')) {
+      mimeType =
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    } else if (lower.endsWith('.png')) {
+      mimeType = 'image/png';
+    }
+    final result = await OpenFilex.open(file.path, type: mimeType);
+    if (result.type != ResultType.done && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Cannot open file: ${result.message}')),
+      );
+    }
+  }
+
   Future<void> _showResultDialog(
     BuildContext context,
     String title,
@@ -131,13 +158,70 @@ class _HomeScreenState extends State<HomeScreen> {
           FilledButton(
             onPressed: () async {
               Navigator.pop(ctx);
-              await OpenFilex.open(file.path);
+              await _openSavedFile(context, file);
             },
             child: const Text('Open'),
           ),
         ],
       ),
     );
+  }
+
+  String _sanitizeXmlText(String input) {
+    final normalized = input
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n')
+        .replaceAll('\f', '\n');
+    final buf = StringBuffer();
+    for (final rune in normalized.runes) {
+      // Valid XML 1.0 characters: 0x9, 0xA, 0xD, 0x20..0xD7FF, 0xE000..0xFFFD, 0x10000..0x10FFFF
+      if (rune == 0x09 ||
+          rune == 0x0A ||
+          rune == 0x0D ||
+          (rune >= 0x20 && rune <= 0xD7FF) ||
+          (rune >= 0xE000 && rune <= 0xFFFD) ||
+          (rune >= 0x10000 && rune <= 0x10FFFF)) {
+        buf.writeCharCode(rune);
+      }
+    }
+    return buf.toString();
+  }
+
+  String _escapeXml(String input) {
+    return _sanitizeXmlText(input)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&apos;');
+  }
+
+  List<String> _splitIntoSafeChunks(String text, {int maxChars = 450}) {
+    final clean = _sanitizeXmlText(text).trim();
+    if (clean.isEmpty) return ['(Empty document)'];
+
+    final chunks = <String>[];
+    final lines = clean.split('\n');
+    for (final rawLine in lines) {
+      final line = rawLine.trimRight();
+      if (line.isEmpty) {
+        chunks.add(' ');
+        continue;
+      }
+      if (line.length <= maxChars) {
+        chunks.add(line);
+      } else {
+        int start = 0;
+        while (start < line.length) {
+          final end = (start + maxChars < line.length)
+              ? start + maxChars
+              : line.length;
+          chunks.add(line.substring(start, end));
+          start = end;
+        }
+      }
+    }
+    return chunks.isEmpty ? ['(Empty document)'] : chunks;
   }
 
   // 1) Image -> PDF
@@ -213,11 +297,23 @@ class _HomeScreenState extends State<HomeScreen> {
 
     await _runTask(context, 'Converting TXT to PDF...', () async {
       final content = await File(res.files.single.path!).readAsString();
+      final chunks = _splitIntoSafeChunks(content, maxChars: 600);
       final doc = pw.Document();
       doc.addPage(
         pw.MultiPage(
           pageFormat: pw_pdf.PdfPageFormat.a4,
-          build: (_) => [pw.Text(content, style: const pw.TextStyle(fontSize: 12))],
+          margin: const pw.EdgeInsets.all(24),
+          build: (_) => chunks
+              .map(
+                (line) => pw.Padding(
+                  padding: const pw.EdgeInsets.only(bottom: 3),
+                  child: pw.Text(
+                    line,
+                    style: const pw.TextStyle(fontSize: 11),
+                  ),
+                ),
+              )
+              .toList(),
         ),
       );
       final bytes = await doc.save();
@@ -229,7 +325,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // 4) DOCX -> PDF
+  // 4) DOCX -> PDF (Safe multi-page chunking so tall text never overflows a single page)
   Future<void> _docxToPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -240,39 +336,98 @@ class _HomeScreenState extends State<HomeScreen> {
     await _runTask(context, 'Converting DOCX to PDF...', () async {
       final docxBytes = await File(res.files.single.path!).readAsBytes();
       final archive = ZipDecoder().decodeBytes(docxBytes);
-      final docXmlFile = archive.findFile('word/document.xml');
-      String extractedText = '';
-      if (docXmlFile != null) {
-        final xmlStr = String.fromCharCodes(docXmlFile.content as List<int>);
-        final documentXml = xml.XmlDocument.parse(xmlStr);
-        final paragraphs = documentXml.findAllElements('w:p');
-        extractedText = paragraphs
-            .map((p) => p.findAllElements('w:t').map((t) => t.innerText).join())
-            .where((line) => line.trim().isNotEmpty)
-            .join('\n\n');
+
+      final parts = <String>[];
+      // Extract header, main document, and footer text in logical order
+      final targetEntries = archive.files
+          .where((f) =>
+              f.isFile &&
+              (f.name.startsWith('word/header') ||
+                  f.name == 'word/document.xml' ||
+                  f.name.startsWith('word/footer')) &&
+              f.name.endsWith('.xml'))
+          .toList()
+        ..sort((a, b) {
+          int rank(String name) {
+            if (name.startsWith('word/header')) return 0;
+            if (name == 'word/document.xml') return 1;
+            return 2;
+          }
+
+          final r = rank(a.name).compareTo(rank(b.name));
+          return r != 0 ? r : a.name.compareTo(b.name);
+        });
+
+      for (final entry in targetEntries) {
+        final rawContent = entry.content;
+        final bytesList = rawContent is List<int>
+            ? rawContent
+            : (rawContent as Uint8List).toList();
+        final xmlStr = _sanitizeXmlText(String.fromCharCodes(bytesList));
+        if (xmlStr.trim().isEmpty) continue;
+
+        try {
+          final documentXml = xml.XmlDocument.parse(xmlStr);
+          final paragraphs = documentXml.findAllElements('w:p');
+          for (final p in paragraphs) {
+            final line = p
+                .findAllElements('w:t')
+                .map((t) => t.innerText)
+                .join()
+                .trim();
+            if (line.isNotEmpty) {
+              parts.add(line);
+            }
+          }
+        } catch (_) {
+          // Fallback tag extraction if XML has custom attributes
+          final matches = RegExp(r'<w:t[^>]*>(.*?)</w:t>', dotAll: true)
+              .allMatches(xmlStr);
+          final fallbackLine = matches.map((m) => m.group(1) ?? '').join().trim();
+          if (fallbackLine.isNotEmpty) {
+            parts.add(fallbackLine);
+          }
+        }
       }
+
+      final combinedText =
+          parts.isEmpty ? '(No readable text found in DOCX)' : parts.join('\n');
+      final chunks = _splitIntoSafeChunks(combinedText, maxChars: 420);
+
       final doc = pw.Document();
       doc.addPage(
         pw.MultiPage(
           pageFormat: pw_pdf.PdfPageFormat.a4,
-          build: (_) => [
-            pw.Text(
-              extractedText.isEmpty ? '(No text found in DOCX)' : extractedText,
-              style: const pw.TextStyle(fontSize: 12),
-            ),
-          ],
+          margin: const pw.EdgeInsets.all(24),
+          build: (_) => chunks
+              .map(
+                (line) => pw.Padding(
+                  padding: const pw.EdgeInsets.only(bottom: 4),
+                  child: pw.Text(
+                    line,
+                    style: const pw.TextStyle(fontSize: 11),
+                  ),
+                ),
+              )
+              .toList(),
         ),
       );
+
       final bytes = await doc.save();
       final out = await _saveOutputFile(
         bytes,
         'docx_${DateTime.now().millisecondsSinceEpoch}.pdf',
       );
-      await _showResultDialog(context, 'DOCX → PDF Done', out);
+      await _showResultDialog(
+        context,
+        'DOCX → PDF Done',
+        out,
+        extraInfo: 'Paragraphs extracted: ${parts.length}',
+      );
     });
   }
 
-  // 5) PDF -> DOCX
+  // 5) PDF -> DOCX (Clean XML escaping & valid OOXML archive)
   Future<void> _pdfToDocx(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -283,17 +438,34 @@ class _HomeScreenState extends State<HomeScreen> {
     await _runTask(context, 'Extracting text to DOCX...', () async {
       final pdfBytes = await File(res.files.single.path!).readAsBytes();
       final sfDoc = sf.PdfDocument(inputBytes: pdfBytes);
-      final text = sf.PdfTextExtractor(sfDoc).extractText();
+      final pageCount = sfDoc.pages.count;
+
+      final pageSections = <String>[];
+      for (int i = 0; i < pageCount; i++) {
+        final pageText =
+            sf.PdfTextExtractor(sfDoc).extractText(startPageIndex: i, endPageIndex: i);
+        final lines = _sanitizeXmlText(pageText).split('\n');
+        for (final rawLine in lines) {
+          final cleaned = rawLine.trim();
+          if (cleaned.isEmpty) continue;
+          final safeLine = _escapeXml(cleaned);
+          pageSections.add(
+            '<w:p><w:r><w:t xml:space="preserve">$safeLine</w:t></w:r></w:p>',
+          );
+        }
+        if (i < pageCount - 1) {
+          pageSections.add('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
+        }
+      }
       sfDoc.dispose();
 
-      final escaped = text
-          .replaceAll('&', '&amp;')
-          .replaceAll('<', '&lt;')
-          .replaceAll('>', '&gt;');
-      final lines = escaped.split('\n');
-      final bodyXml = lines
-          .map((l) => '<w:p><w:r><w:t xml:space="preserve">$l</w:t></w:r></w:p>')
-          .join();
+      if (pageSections.isEmpty) {
+        pageSections.add(
+          '<w:p><w:r><w:t xml:space="preserve">(No selectable text found in PDF)</w:t></w:r></w:p>',
+        );
+      }
+
+      final bodyXml = pageSections.join();
 
       final documentXml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -313,16 +485,39 @@ class _HomeScreenState extends State<HomeScreen> {
 </Relationships>''';
 
       final archive = Archive()
-        ..addFile(ArchiveFile('[Content_Types].xml', contentTypesXml.length, contentTypesXml.codeUnits))
-        ..addFile(ArchiveFile('_rels/.rels', relsXml.length, relsXml.codeUnits))
-        ..addFile(ArchiveFile('word/document.xml', documentXml.length, documentXml.codeUnits));
+        ..addFile(
+          ArchiveFile(
+            '[Content_Types].xml',
+            contentTypesXml.length,
+            contentTypesXml.codeUnits,
+          ),
+        )
+        ..addFile(
+          ArchiveFile(
+            '_rels/.rels',
+            relsXml.length,
+            relsXml.codeUnits,
+          ),
+        )
+        ..addFile(
+          ArchiveFile(
+            'word/document.xml',
+            documentXml.length,
+            documentXml.codeUnits,
+          ),
+        );
 
       final zipBytes = ZipEncoder().encode(archive) ?? <int>[];
       final out = await _saveOutputFile(
         Uint8List.fromList(zipBytes),
         'converted_${DateTime.now().millisecondsSinceEpoch}.docx',
       );
-      await _showResultDialog(context, 'PDF → DOCX Done', out);
+      await _showResultDialog(
+        context,
+        'PDF → DOCX Done',
+        out,
+        extraInfo: 'Pages processed: $pageCount',
+      );
     });
   }
 
@@ -603,7 +798,8 @@ class _HomeScreenState extends State<HomeScreen> {
       final targetBytes = (originalBytes.length * ratio).round();
 
       final rawPages = <({Uint8List png, double widthPt, double heightPt})>[];
-      await for (final rasterPage in Printing.raster(originalBytes, dpi: renderDpi)) {
+      await for (final rasterPage
+          in Printing.raster(originalBytes, dpi: renderDpi)) {
         final pngBytes = await rasterPage.toPng();
         rawPages.add((
           png: pngBytes,
@@ -636,7 +832,8 @@ class _HomeScreenState extends State<HomeScreen> {
           final img = pw.MemoryImage(jpgBytes);
           outPdf.addPage(
             pw.Page(
-              pageFormat: pw_pdf.PdfPageFormat(p.widthPt, p.heightPt, marginAll: 0),
+              pageFormat:
+                  pw_pdf.PdfPageFormat(p.widthPt, p.heightPt, marginAll: 0),
               build: (_) => pw.Image(img, fit: pw.BoxFit.fill),
             ),
           );
@@ -647,7 +844,6 @@ class _HomeScreenState extends State<HomeScreen> {
         if (candidate.length <= targetBytes) {
           break;
         }
-        // First lower JPEG quality slightly so text remains crisp, then width
         if (jpegQuality > 42) {
           jpegQuality = (jpegQuality - 12).clamp(38, 85);
         } else if (maxWidth > 420) {
