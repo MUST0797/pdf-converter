@@ -19,5 +19,15 @@ dependencies:
   syncfusion_flutter_pdf: any
   printing: ^5.13.0
 
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_launcher_icons: ^0.14.3
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon.png"
+
 flutter:
   uses-material-design: true
