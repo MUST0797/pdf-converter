@@ -369,6 +369,48 @@ class _HomeScreenState extends State<HomeScreen> {
     return lines.join('\n').trim();
   }
 
+  Map<int, pw.TableColumnWidth> _columnWidthsForRows(
+    List<List<String>> rows,
+    int colCount,
+  ) {
+    final isChecklist5Col = colCount == 5 &&
+        rows.any((r) =>
+            r.any((c) => c.toUpperCase().contains('S. NO')) ||
+            r.any((c) => c.toUpperCase().contains('INSTRUMENTS')) ||
+            RegExp(r'^\d+$').hasMatch(r.first.trim()));
+
+    if (isChecklist5Col) {
+      return {
+        0: const pw.FixedColumnWidth(32),
+        1: const pw.FlexColumnWidth(2.5),
+        2: const pw.FixedColumnWidth(42),
+        3: const pw.FlexColumnWidth(1.3),
+        4: const pw.FlexColumnWidth(1.1),
+      };
+    }
+
+    if (colCount == 2) {
+      return {
+        0: const pw.FlexColumnWidth(1.6),
+        1: const pw.FlexColumnWidth(2.4),
+      };
+    }
+
+    if (colCount == 3) {
+      return {
+        0: const pw.FlexColumnWidth(1.6),
+        1: const pw.FlexColumnWidth(1.6),
+        2: const pw.FlexColumnWidth(1.2),
+      };
+    }
+
+    final map = <int, pw.TableColumnWidth>{};
+    for (int c = 0; c < colCount; c++) {
+      map[c] = const pw.FlexColumnWidth();
+    }
+    return map;
+  }
+
   List<pw.Widget> _buildPdfWidgetsFromBlocks(List<_DocxBlock> blocks) {
     final widgets = <pw.Widget>[];
     for (final b in blocks) {
@@ -387,39 +429,40 @@ class _HomeScreenState extends State<HomeScreen> {
       } else if (b.type == _DocxBlockType.table &&
           b.rows != null &&
           b.rows!.isNotEmpty) {
-        final colCount = b.rows!.first.length;
-        final colWidths = <int, pw.TableColumnWidth>{};
-        for (int c = 0; c < colCount; c++) {
-          if (colCount == 5 && c == 0) {
-            colWidths[c] = const pw.FixedColumnWidth(36);
-          } else if (colCount == 5 && c == 2) {
-            colWidths[c] = const pw.FixedColumnWidth(48);
+        // Group consecutive rows with same column count so mixed tables don't force narrow cols
+        final groups = <List<List<String>>>[];
+        for (final row in b.rows!) {
+          if (groups.isEmpty || groups.last.first.length != row.length) {
+            groups.add([row]);
           } else {
-            colWidths[c] = const pw.FlexColumnWidth();
+            groups.last.add(row);
           }
         }
 
-        // Split large tables into chunks of 14 rows so MultiPage never overflows
-        for (int start = 0; start < b.rows!.length; start += 14) {
-          final end =
-              (start + 14 < b.rows!.length) ? start + 14 : b.rows!.length;
-          final subRows = b.rows!.sublist(start, end);
-          widgets.add(
-            pw.Padding(
-              padding: const pw.EdgeInsets.symmetric(vertical: 4),
-              child: pw.Table(
+        for (final groupRows in groups) {
+          final colCount = groupRows.first.length;
+          final colWidths = _columnWidthsForRows(groupRows, colCount);
+
+          for (int start = 0; start < groupRows.length; start += 16) {
+            final end = (start + 16 < groupRows.length)
+                ? start + 16
+                : groupRows.length;
+            final subRows = groupRows.sublist(start, end);
+
+            widgets.add(
+              pw.Table(
                 border: pw.TableBorder.all(
                   color: pw_pdf.PdfColors.grey600,
                   width: 0.6,
                 ),
                 columnWidths: colWidths,
                 children: subRows.map((row) {
-                  final isBannerRow = row.length >= 2 &&
-                      row[0].toUpperCase().contains('PREVENTIVE MAINTENANCE');
-                  final isHeaderRow = row.any((cell) =>
-                      cell.toUpperCase().contains('S. NO') ||
-                      cell.toUpperCase().contains('INSTRUMENTS') ||
-                      cell.toUpperCase().contains('NORMAL PARAMETERS'));
+                  final joinedUpper = row.join(' ').toUpperCase();
+                  final isBannerRow =
+                      joinedUpper.contains('PREVENTIVE MAINTENANCE');
+                  final isHeaderRow = joinedUpper.contains('S. NO') ||
+                      joinedUpper.contains('INSTRUMENTS') ||
+                      joinedUpper.contains('NORMAL PARAMETERS');
                   return pw.TableRow(
                     decoration: (isBannerRow || isHeaderRow)
                         ? const pw.BoxDecoration(
@@ -430,8 +473,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         .map(
                           (cell) => pw.Padding(
                             padding: const pw.EdgeInsets.symmetric(
-                              horizontal: 4,
-                              vertical: 3,
+                              horizontal: 5,
+                              vertical: 3.5,
                             ),
                             child: pw.Text(
                               cell,
@@ -448,8 +491,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   );
                 }).toList(),
               ),
-            ),
-          );
+            );
+          }
         }
       }
     }
