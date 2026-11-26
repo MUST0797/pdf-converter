@@ -180,6 +180,11 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Uint8List _contentToBytes(dynamic content) {
+    if (content is Uint8List) return content;
+    return Uint8List.fromList((content as List<int>));
+  }
+
   String _cleanText(String input) {
     final normalized = input
         .replaceAll('\r\n', '\n')
@@ -286,7 +291,6 @@ class _HomeScreenState extends State<HomeScreen> {
     return lines.join(' ').trim();
   }
 
-  // Compacts empty merged cells so rows keep their true logical columns
   List<_DocxBlock> _parseDocxBlocks(String xmlStr) {
     final cleaned = _cleanText(xmlStr);
     if (cleaned.trim().isEmpty) return const [];
@@ -462,8 +466,12 @@ class _HomeScreenState extends State<HomeScreen> {
                     5,
                     (i) => i < r.length ? r[i] : '',
                   );
-                  final isHead = normalized.join(' ').toUpperCase().contains('S. NO') ||
-                      normalized.join(' ').toUpperCase().contains('INSTRUMENTS');
+                  final isHead =
+                      normalized.join(' ').toUpperCase().contains('S. NO') ||
+                          normalized
+                              .join(' ')
+                              .toUpperCase()
+                              .contains('INSTRUMENTS');
                   return pw.TableRow(
                     decoration: isHead
                         ? const pw.BoxDecoration(color: pw_pdf.PdfColors.blue100)
@@ -691,7 +699,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // 4) DOCX -> PDF (Clean Original Layout)
+  // 4) DOCX -> PDF (Includes embedded DOCX media images + Header + Table + Footer)
   Future<void> _docxToPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -703,13 +711,28 @@ class _HomeScreenState extends State<HomeScreen> {
       final docxBytes = await File(res.files.single.path!).readAsBytes();
       final archive = ZipDecoder().decodeBytes(docxBytes);
 
+      final mediaImages = <pw.MemoryImage>[];
+      for (final f in archive.files) {
+        if (!f.isFile) continue;
+        final lowerName = f.name.toLowerCase();
+        if (lowerName.startsWith('word/media/') &&
+            (lowerName.endsWith('.png') ||
+                lowerName.endsWith('.jpg') ||
+                lowerName.endsWith('.jpeg'))) {
+          try {
+            mediaImages.add(pw.MemoryImage(_contentToBytes(f.content)));
+          } catch (_) {
+            // Skip unsupported sub-image if any
+          }
+        }
+      }
+
       List<_DocxBlock> readBlocks(String entryName) {
         final f = archive.findFile(entryName);
         if (f == null) return const [];
-        final raw = f.content;
-        final bytes =
-            raw is Uint8List ? raw : Uint8List.fromList((raw as List<int>));
-        return _parseDocxBlocks(utf8.decode(bytes, allowMalformed: true));
+        return _parseDocxBlocks(
+          utf8.decode(_contentToBytes(f.content), allowMalformed: true),
+        );
       }
 
       final headerBlocks = <_DocxBlock>[];
@@ -743,30 +766,52 @@ class _HomeScreenState extends State<HomeScreen> {
           ? extractedFooter
           : 'Office 321, Building 5WA, Dubai Airport Free Zone, P.O. Box: 371820, Tel.: +971-4-2602308, www.nuctech.com';
 
+      final topBannerImages = mediaImages.take(3).toList();
+
       final doc = pw.Document();
       doc.addPage(
         pw.MultiPage(
           pageFormat: pw_pdf.PdfPageFormat.a4,
           margin: const pw.EdgeInsets.all(20),
-          header: (_) => pw.Container(
-            padding: const pw.EdgeInsets.only(bottom: 5),
-            margin: const pw.EdgeInsets.only(bottom: 8),
-            decoration: const pw.BoxDecoration(
-              border: pw.Border(
-                bottom: pw.BorderSide(
-                  color: pw_pdf.PdfColors.grey600,
-                  width: 0.8,
+          header: (_) => pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+            children: [
+              if (topBannerImages.isNotEmpty)
+                pw.Padding(
+                  padding: const pw.EdgeInsets.only(bottom: 4),
+                  child: pw.Row(
+                    mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                    children: topBannerImages
+                        .map(
+                          (img) => pw.SizedBox(
+                            height: 28,
+                            child: pw.Image(img, fit: pw.BoxFit.contain),
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ),
+              pw.Container(
+                padding: const pw.EdgeInsets.only(bottom: 5),
+                margin: const pw.EdgeInsets.only(bottom: 8),
+                decoration: const pw.BoxDecoration(
+                  border: pw.Border(
+                    bottom: pw.BorderSide(
+                      color: pw_pdf.PdfColors.grey600,
+                      width: 0.8,
+                    ),
+                  ),
+                ),
+                child: pw.Text(
+                  headerDisplay,
+                  style: pw.TextStyle(
+                    fontSize: 9,
+                    fontWeight: pw.FontWeight.bold,
+                    color: pw_pdf.PdfColors.blue900,
+                  ),
                 ),
               ),
-            ),
-            child: pw.Text(
-              headerDisplay,
-              style: pw.TextStyle(
-                fontSize: 9,
-                fontWeight: pw.FontWeight.bold,
-                color: pw_pdf.PdfColors.blue900,
-              ),
-            ),
+            ],
           ),
           footer: (ctx) => pw.Container(
             padding: const pw.EdgeInsets.only(top: 5),
