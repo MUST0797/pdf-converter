@@ -174,7 +174,6 @@ class _HomeScreenState extends State<HomeScreen> {
         .replaceAll('\f', '\n');
     final buf = StringBuffer();
     for (final rune in normalized.runes) {
-      // Valid XML 1.0 characters: 0x9, 0xA, 0xD, 0x20..0xD7FF, 0xE000..0xFFFD, 0x10000..0x10FFFF
       if (rune == 0x09 ||
           rune == 0x0A ||
           rune == 0x0D ||
@@ -222,6 +221,31 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
     return chunks.isEmpty ? ['(Empty document)'] : chunks;
+  }
+
+  String _extractXmlParagraphs(String xmlStr) {
+    final cleanedXml = _sanitizeXmlText(xmlStr);
+    if (cleanedXml.trim().isEmpty) return '';
+    try {
+      final documentXml = xml.XmlDocument.parse(cleanedXml);
+      final paragraphs = documentXml.findAllElements('w:p');
+      final lines = <String>[];
+      for (final p in paragraphs) {
+        final line = p
+            .findAllElements('w:t')
+            .map((t) => t.innerText)
+            .join()
+            .trim();
+        if (line.isNotEmpty) {
+          lines.add(line);
+        }
+      }
+      return lines.join('\n');
+    } catch (_) {
+      final matches =
+          RegExp(r'<w:t[^>]*>(.*?)</w:t>', dotAll: true).allMatches(cleanedXml);
+      return matches.map((m) => m.group(1) ?? '').join().trim();
+    }
   }
 
   // 1) Image -> PDF
@@ -325,7 +349,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // 4) DOCX -> PDF (Safe multi-page chunking so tall text never overflows a single page)
+  // 4) DOCX -> PDF (Preserves Header, Body, Footer order cleanly)
   Future<void> _docxToPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -337,61 +361,31 @@ class _HomeScreenState extends State<HomeScreen> {
       final docxBytes = await File(res.files.single.path!).readAsBytes();
       final archive = ZipDecoder().decodeBytes(docxBytes);
 
-      final parts = <String>[];
-      // Extract header, main document, and footer text in logical order
-      final targetEntries = archive.files
-          .where((f) =>
-              f.isFile &&
-              (f.name.startsWith('word/header') ||
-                  f.name == 'word/document.xml' ||
-                  f.name.startsWith('word/footer')) &&
-              f.name.endsWith('.xml'))
-          .toList()
-        ..sort((a, b) {
-          int rank(String name) {
-            if (name.startsWith('word/header')) return 0;
-            if (name == 'word/document.xml') return 1;
-            return 2;
-          }
-
-          final r = rank(a.name).compareTo(rank(b.name));
-          return r != 0 ? r : a.name.compareTo(b.name);
-        });
-
-      for (final entry in targetEntries) {
-        final rawContent = entry.content;
-        final bytesList = rawContent is List<int>
-            ? rawContent
-            : (rawContent as Uint8List).toList();
-        final xmlStr = _sanitizeXmlText(String.fromCharCodes(bytesList));
-        if (xmlStr.trim().isEmpty) continue;
-
-        try {
-          final documentXml = xml.XmlDocument.parse(xmlStr);
-          final paragraphs = documentXml.findAllElements('w:p');
-          for (final p in paragraphs) {
-            final line = p
-                .findAllElements('w:t')
-                .map((t) => t.innerText)
-                .join()
-                .trim();
-            if (line.isNotEmpty) {
-              parts.add(line);
-            }
-          }
-        } catch (_) {
-          // Fallback tag extraction if XML has custom attributes
-          final matches = RegExp(r'<w:t[^>]*>(.*?)</w:t>', dotAll: true)
-              .allMatches(xmlStr);
-          final fallbackLine = matches.map((m) => m.group(1) ?? '').join().trim();
-          if (fallbackLine.isNotEmpty) {
-            parts.add(fallbackLine);
-          }
-        }
+      String readEntry(String entryName) {
+        final f = archive.findFile(entryName);
+        if (f == null) return '';
+        final raw = f.content;
+        final list = raw is List<int> ? raw : (raw as Uint8List).toList();
+        return _extractXmlParagraphs(String.fromCharCodes(list));
       }
 
-      final combinedText =
-          parts.isEmpty ? '(No readable text found in DOCX)' : parts.join('\n');
+      final sections = <String>[];
+      final headerText = readEntry('word/header1.xml');
+      if (headerText.isNotEmpty) {
+        sections.add(headerText);
+      }
+      final bodyText = readEntry('word/document.xml');
+      if (bodyText.isNotEmpty) {
+        sections.add(bodyText);
+      }
+      final footerText = readEntry('word/footer1.xml');
+      if (footerText.isNotEmpty) {
+        sections.add(footerText);
+      }
+
+      final combinedText = sections.isEmpty
+          ? '(No readable text found in DOCX)'
+          : sections.join('\n\n');
       final chunks = _splitIntoSafeChunks(combinedText, maxChars: 420);
 
       final doc = pw.Document();
@@ -418,16 +412,11 @@ class _HomeScreenState extends State<HomeScreen> {
         bytes,
         'docx_${DateTime.now().millisecondsSinceEpoch}.pdf',
       );
-      await _showResultDialog(
-        context,
-        'DOCX → PDF Done',
-        out,
-        extraInfo: 'Paragraphs extracted: ${parts.length}',
-      );
+      await _showResultDialog(context, 'DOCX → PDF Done', out);
     });
   }
 
-  // 5) PDF -> DOCX (Clean XML escaping & valid OOXML archive)
+  // 5) PDF -> DOCX (Clean paragraph & page break structure)
   Future<void> _pdfToDocx(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -442,8 +431,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final pageSections = <String>[];
       for (int i = 0; i < pageCount; i++) {
-        final pageText =
-            sf.PdfTextExtractor(sfDoc).extractText(startPageIndex: i, endPageIndex: i);
+        final pageText = sf.PdfTextExtractor(sfDoc)
+            .extractText(startPageIndex: i, endPageIndex: i);
         final lines = _sanitizeXmlText(pageText).split('\n');
         for (final rawLine in lines) {
           final cleaned = rawLine.trim();
