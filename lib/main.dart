@@ -163,7 +163,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  String _sanitizeXmlText(String input) {
+  String _cleanText(String input) {
     final normalized = input
         .replaceAll('\r\n', '\n')
         .replaceAll('\r', '\n')
@@ -183,7 +183,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _escapeXml(String input) {
-    return _sanitizeXmlText(input)
+    return _cleanText(input)
         .replaceAll('&', '&amp;')
         .replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;')
@@ -191,56 +191,49 @@ class _HomeScreenState extends State<HomeScreen> {
         .replaceAll("'", '&apos;');
   }
 
-  List<String> _splitIntoSafeChunks(String text, {int maxChars = 450}) {
-    final clean = _sanitizeXmlText(text).trim();
+  List<String> _splitForMultiPage(String text, {int maxChars = 400}) {
+    final clean = _cleanText(text).trim();
     if (clean.isEmpty) return ['(Empty document)'];
 
-    final chunks = <String>[];
-    final lines = clean.split('\n');
-    for (final rawLine in lines) {
+    final out = <String>[];
+    for (final rawLine in clean.split('\n')) {
       final line = rawLine.trimRight();
       if (line.isEmpty) {
-        chunks.add(' ');
+        out.add(' ');
         continue;
       }
       if (line.length <= maxChars) {
-        chunks.add(line);
+        out.add(line);
       } else {
         int start = 0;
         while (start < line.length) {
-          final end = (start + maxChars < line.length)
-              ? start + maxChars
-              : line.length;
-          chunks.add(line.substring(start, end));
+          final end =
+              (start + maxChars < line.length) ? start + maxChars : line.length;
+          out.add(line.substring(start, end));
           start = end;
         }
       }
     }
-    return chunks.isEmpty ? ['(Empty document)'] : chunks;
+    return out;
   }
 
-  String _extractXmlParagraphs(String xmlStr) {
-    final cleanedXml = _sanitizeXmlText(xmlStr);
-    if (cleanedXml.trim().isEmpty) return '';
+  String _parseDocxXml(String xmlStr) {
+    final cleaned = _cleanText(xmlStr);
+    if (cleaned.trim().isEmpty) return '';
     try {
-      final documentXml = xml.XmlDocument.parse(cleanedXml);
-      final paragraphs = documentXml.findAllElements('w:p');
+      final docXml = xml.XmlDocument.parse(cleaned);
       final lines = <String>[];
-      for (final p in paragraphs) {
-        final line = p
-            .findAllElements('w:t')
-            .map((t) => t.innerText)
-            .join()
-            .trim();
-        if (line.isNotEmpty) {
-          lines.add(line);
+      for (final p in docXml.findAllElements('w:p')) {
+        final t = p.findAllElements('w:t').map((e) => e.innerText).join().trim();
+        if (t.isNotEmpty) {
+          lines.add(t);
         }
       }
       return lines.join('\n');
     } catch (_) {
       final matches =
-          RegExp(r'<w:t[^>]*>(.*?)</w:t>', dotAll: true).allMatches(cleanedXml);
-      return matches.map((m) => m.group(1) ?? '').join().trim();
+          RegExp(r'<w:t[^>]*>(.*?)</w:t>', dotAll: true).allMatches(cleaned);
+      return matches.map((m) => m.group(1) ?? '').join(' ').trim();
     }
   }
 
@@ -317,7 +310,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     await _runTask(context, 'Converting TXT to PDF...', () async {
       final content = await File(res.files.single.path!).readAsString();
-      final chunks = _splitIntoSafeChunks(content, maxChars: 600);
+      final chunks = _splitForMultiPage(content, maxChars: 550);
       final doc = pw.Document();
       doc.addPage(
         pw.MultiPage(
@@ -327,10 +320,7 @@ class _HomeScreenState extends State<HomeScreen> {
               .map(
                 (line) => pw.Padding(
                   padding: const pw.EdgeInsets.only(bottom: 3),
-                  child: pw.Text(
-                    line,
-                    style: const pw.TextStyle(fontSize: 11),
-                  ),
+                  child: pw.Text(line, style: const pw.TextStyle(fontSize: 11)),
                 ),
               )
               .toList(),
@@ -345,7 +335,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // 4) DOCX -> PDF (Preserves Header, Body, Footer order cleanly)
+  // 4) DOCX -> PDF (Header -> Body -> Footer order)
   Future<void> _docxToPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -357,32 +347,43 @@ class _HomeScreenState extends State<HomeScreen> {
       final docxBytes = await File(res.files.single.path!).readAsBytes();
       final archive = ZipDecoder().decodeBytes(docxBytes);
 
-      String readEntry(String entryName) {
-        final f = archive.findFile(entryName);
+      String readPart(String name) {
+        final f = archive.findFile(name);
         if (f == null) return '';
         final raw = f.content;
-        final list = raw is List<int> ? raw : (raw as Uint8List).toList();
-        return _extractXmlParagraphs(String.fromCharCodes(list));
+        final bytes = raw is List<int> ? raw : (raw as Uint8List).toList();
+        return _parseDocxXml(String.fromCharCodes(bytes));
       }
 
-      final sections = <String>[];
-      final headerText = readEntry('word/header1.xml');
-      if (headerText.isNotEmpty) {
-        sections.add(headerText);
-      }
-      final bodyText = readEntry('word/document.xml');
-      if (bodyText.isNotEmpty) {
-        sections.add(bodyText);
-      }
-      final footerText = readEntry('word/footer1.xml');
-      if (footerText.isNotEmpty) {
-        sections.add(footerText);
-      }
+      final headers = archive.files
+          .where((f) =>
+              f.isFile &&
+              f.name.startsWith('word/header') &&
+              f.name.endsWith('.xml'))
+          .map((f) => readPart(f.name))
+          .where((s) => s.isNotEmpty)
+          .toList();
 
-      final combinedText = sections.isEmpty
-          ? '(No readable text found in DOCX)'
-          : sections.join('\n\n');
-      final chunks = _splitIntoSafeChunks(combinedText, maxChars: 420);
+      final body = readPart('word/document.xml');
+
+      final footers = archive.files
+          .where((f) =>
+              f.isFile &&
+              f.name.startsWith('word/footer') &&
+              f.name.endsWith('.xml'))
+          .map((f) => readPart(f.name))
+          .where((s) => s.isNotEmpty)
+          .toList();
+
+      final combined = [
+        ...headers,
+        if (body.isNotEmpty) body,
+        ...footers,
+      ].join('\n\n');
+
+      final finalText =
+          combined.trim().isEmpty ? '(No text found in DOCX)' : combined;
+      final chunks = _splitForMultiPage(finalText, maxChars: 400);
 
       final doc = pw.Document();
       doc.addPage(
@@ -393,10 +394,7 @@ class _HomeScreenState extends State<HomeScreen> {
               .map(
                 (line) => pw.Padding(
                   padding: const pw.EdgeInsets.only(bottom: 4),
-                  child: pw.Text(
-                    line,
-                    style: const pw.TextStyle(fontSize: 11),
-                  ),
+                  child: pw.Text(line, style: const pw.TextStyle(fontSize: 11)),
                 ),
               )
               .toList(),
@@ -412,7 +410,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // 5) PDF -> DOCX (Clean paragraph & page break structure)
+  // 5) PDF -> DOCX
   Future<void> _pdfToDocx(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -423,34 +421,23 @@ class _HomeScreenState extends State<HomeScreen> {
     await _runTask(context, 'Extracting text to DOCX...', () async {
       final pdfBytes = await File(res.files.single.path!).readAsBytes();
       final sfDoc = sf.PdfDocument(inputBytes: pdfBytes);
-      final pageCount = sfDoc.pages.count;
-
-      final pageSections = <String>[];
-      for (int i = 0; i < pageCount; i++) {
-        final pageText = sf.PdfTextExtractor(sfDoc)
-            .extractText(startPageIndex: i, endPageIndex: i);
-        final lines = _sanitizeXmlText(pageText).split('\n');
-        for (final rawLine in lines) {
-          final cleaned = rawLine.trim();
-          if (cleaned.isEmpty) continue;
-          final safeLine = _escapeXml(cleaned);
-          pageSections.add(
-            '<w:p><w:r><w:t xml:space="preserve">$safeLine</w:t></w:r></w:p>',
-          );
-        }
-        if (i < pageCount - 1) {
-          pageSections.add('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
-        }
-      }
+      final extracted = sf.PdfTextExtractor(sfDoc).extractText();
       sfDoc.dispose();
 
-      if (pageSections.isEmpty) {
-        pageSections.add(
-          '<w:p><w:r><w:t xml:space="preserve">(No selectable text found in PDF)</w:t></w:r></w:p>',
-        );
-      }
+      final cleanedLines = _cleanText(extracted)
+          .split('\n')
+          .map((l) => l.trim())
+          .where((l) => l.isNotEmpty)
+          .toList();
 
-      final bodyXml = pageSections.join();
+      final bodyXml = cleanedLines.isEmpty
+          ? '<w:p><w:r><w:t xml:space="preserve">(No selectable text found in PDF)</w:t></w:r></w:p>'
+          : cleanedLines
+              .map(
+                (line) =>
+                    '<w:p><w:r><w:t xml:space="preserve">${_escapeXml(line)}</w:t></w:r></w:p>',
+              )
+              .join();
 
       final documentXml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -497,12 +484,7 @@ class _HomeScreenState extends State<HomeScreen> {
         Uint8List.fromList(zipBytes),
         'converted_${DateTime.now().millisecondsSinceEpoch}.docx',
       );
-      await _showResultDialog(
-        context,
-        'PDF → DOCX Done',
-        out,
-        extraInfo: 'Pages processed: $pageCount',
-      );
+      await _showResultDialog(context, 'PDF → DOCX Done', out);
     });
   }
 
