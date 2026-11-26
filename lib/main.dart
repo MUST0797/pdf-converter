@@ -512,6 +512,18 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<Uint8List> _downscalePng(Uint8List pngBytes, int targetWidth) async {
+    final codec = await ui.instantiateImageCodec(
+      pngBytes,
+      targetWidth: targetWidth,
+    );
+    final frame = await codec.getNextFrame();
+    final byteData = await frame.image.toByteData(format: ui.ImageByteFormat.png);
+    frame.image.dispose();
+    codec.dispose();
+    return byteData?.buffer.asUint8List() ?? pngBytes;
+  }
+
   // 7) PDF File Compressor (High / Normal / Low Quality)
   Future<void> _compressPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
@@ -531,7 +543,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: const ListTile(
               leading: Icon(Icons.high_quality),
               title: Text('High Quality'),
-              subtitle: Text('Best clarity, lighter compression'),
+              subtitle: Text('Target ~50% of original size'),
             ),
           ),
           SimpleDialogOption(
@@ -539,7 +551,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: const ListTile(
               leading: Icon(Icons.tune),
               title: Text('Normal Quality'),
-              subtitle: Text('Balanced quality & smaller file size'),
+              subtitle: Text('Target ~25% of original size'),
             ),
           ),
           SimpleDialogOption(
@@ -547,7 +559,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: const ListTile(
               leading: Icon(Icons.compress),
               title: Text('Low Quality'),
-              subtitle: Text('Maximum size reduction'),
+              subtitle: Text('Target ~12.5% of original size'),
             ),
           ),
         ],
@@ -556,10 +568,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (quality == null || !context.mounted) return;
 
-    final double dpi = switch (quality) {
-      CompressQuality.high => 150,
-      CompressQuality.normal => 105,
-      CompressQuality.low => 72,
+    // Ratio targets: High ~0.50 (0.52 MB for 1.04 MB), Normal ~0.25 (0.26 MB), Low ~0.125 (0.13 MB)
+    final double ratio = switch (quality) {
+      CompressQuality.high => 0.50,
+      CompressQuality.normal => 0.25,
+      CompressQuality.low => 0.125,
+    };
+
+    final double baseDpi = switch (quality) {
+      CompressQuality.high => 72,
+      CompressQuality.normal => 54,
+      CompressQuality.low => 40,
     };
 
     final String qualityLabel = switch (quality) {
@@ -572,34 +591,58 @@ class _HomeScreenState extends State<HomeScreen> {
       final originalFile = File(res.files.single.path!);
       final originalBytes = await originalFile.readAsBytes();
       final originalKb = (originalBytes.length / 1024).toStringAsFixed(1);
+      final targetBytes = (originalBytes.length * ratio).round();
 
-      final outPdf = pw.Document();
-      await for (final rasterPage in Printing.raster(originalBytes, dpi: dpi)) {
+      final rawPages = <({Uint8List png, double widthPt, double heightPt})>[];
+      await for (final rasterPage in Printing.raster(originalBytes, dpi: baseDpi)) {
         final pngBytes = await rasterPage.toPng();
-        final img = pw.MemoryImage(pngBytes);
-        outPdf.addPage(
-          pw.Page(
-            pageFormat: pw_pdf.PdfPageFormat(
-              rasterPage.width * 72 / dpi,
-              rasterPage.height * 72 / dpi,
-              marginAll: 0,
-            ),
-            build: (_) => pw.Image(img, fit: pw.BoxFit.fill),
-          ),
-        );
+        rawPages.add((
+          png: pngBytes,
+          widthPt: rasterPage.width * 72 / baseDpi,
+          heightPt: rasterPage.height * 72 / baseDpi,
+        ));
       }
 
-      final compressedBytes = await outPdf.save();
+      double scaleFactor = switch (quality) {
+        CompressQuality.high => 0.70,
+        CompressQuality.normal => 0.50,
+        CompressQuality.low => 0.35,
+      };
+
+      Uint8List bestBytes = originalBytes;
+      for (int attempt = 0; attempt < 6; attempt++) {
+        final outPdf = pw.Document();
+        for (final p in rawPages) {
+          final targetW = (p.widthPt * scaleFactor).round().clamp(180, 1200);
+          final scaledPng = await _downscalePng(p.png, targetW);
+          final img = pw.MemoryImage(scaledPng);
+          outPdf.addPage(
+            pw.Page(
+              pageFormat: pw_pdf.PdfPageFormat(p.widthPt, p.heightPt, marginAll: 0),
+              build: (_) => pw.Image(img, fit: pw.BoxFit.fill),
+            ),
+          );
+        }
+
+        final candidate = await outPdf.save();
+        bestBytes = candidate;
+        if (candidate.length <= targetBytes || scaleFactor <= 0.18) {
+          break;
+        }
+        scaleFactor *= 0.72;
+      }
+
       final outFile = await _saveOutputFile(
-        compressedBytes,
+        bestBytes,
         'compressed_${DateTime.now().millisecondsSinceEpoch}.pdf',
       );
 
+      final targetKb = (targetBytes / 1024).toStringAsFixed(1);
       await _showResultDialog(
         context,
         'PDF Compressed ($qualityLabel)',
         outFile,
-        extraInfo: 'Original: $originalKb KB',
+        extraInfo: 'Original: $originalKb KB | Target: ~$targetKb KB',
       );
     });
   }
