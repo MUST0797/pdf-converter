@@ -12,6 +12,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 
 import 'office_tools.dart';
+import 'pdf_to_docx.dart';
 
 void main() => runApp(const PdfApp());
 
