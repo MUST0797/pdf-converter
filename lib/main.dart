@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img_lib;
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart' as pw_pdf;
@@ -512,16 +513,25 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<Uint8List> _downscalePng(Uint8List pngBytes, int targetWidth) async {
-    final codec = await ui.instantiateImageCodec(
-      pngBytes,
-      targetWidth: targetWidth,
+  Uint8List _encodeSharpJpeg(
+    Uint8List pngBytes, {
+    required int maxWidth,
+    required int jpegQuality,
+  }) {
+    final decoded = img_lib.decodeImage(pngBytes);
+    if (decoded == null) return pngBytes;
+
+    img_lib.Image working = decoded;
+    if (working.width > maxWidth) {
+      working = img_lib.copyResize(
+        working,
+        width: maxWidth,
+        interpolation: img_lib.Interpolation.cubic,
+      );
+    }
+    return Uint8List.fromList(
+      img_lib.encodeJpg(working, quality: jpegQuality),
     );
-    final frame = await codec.getNextFrame();
-    final byteData = await frame.image.toByteData(format: ui.ImageByteFormat.png);
-    frame.image.dispose();
-    codec.dispose();
-    return byteData?.buffer.asUint8List() ?? pngBytes;
   }
 
   // 7) PDF File Compressor (High / Normal / Low Quality)
@@ -543,7 +553,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: const ListTile(
               leading: Icon(Icons.high_quality),
               title: Text('High Quality'),
-              subtitle: Text('Target ~50% of original size'),
+              subtitle: Text('Sharp text & ~50% target size'),
             ),
           ),
           SimpleDialogOption(
@@ -551,7 +561,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: const ListTile(
               leading: Icon(Icons.tune),
               title: Text('Normal Quality'),
-              subtitle: Text('Target ~25% of original size'),
+              subtitle: Text('Clear text & ~25% target size'),
             ),
           ),
           SimpleDialogOption(
@@ -559,7 +569,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: const ListTile(
               leading: Icon(Icons.compress),
               title: Text('Low Quality'),
-              subtitle: Text('Target ~12.5% of original size'),
+              subtitle: Text('Smallest size (~12.5% target)'),
             ),
           ),
         ],
@@ -568,17 +578,16 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (quality == null || !context.mounted) return;
 
-    // Ratio targets: High ~0.50 (0.52 MB for 1.04 MB), Normal ~0.25 (0.26 MB), Low ~0.125 (0.13 MB)
     final double ratio = switch (quality) {
       CompressQuality.high => 0.50,
       CompressQuality.normal => 0.25,
       CompressQuality.low => 0.125,
     };
 
-    final double baseDpi = switch (quality) {
-      CompressQuality.high => 72,
-      CompressQuality.normal => 54,
-      CompressQuality.low => 40,
+    final double renderDpi = switch (quality) {
+      CompressQuality.high => 130,
+      CompressQuality.normal => 96,
+      CompressQuality.low => 72,
     };
 
     final String qualityLabel = switch (quality) {
@@ -594,28 +603,37 @@ class _HomeScreenState extends State<HomeScreen> {
       final targetBytes = (originalBytes.length * ratio).round();
 
       final rawPages = <({Uint8List png, double widthPt, double heightPt})>[];
-      await for (final rasterPage in Printing.raster(originalBytes, dpi: baseDpi)) {
+      await for (final rasterPage in Printing.raster(originalBytes, dpi: renderDpi)) {
         final pngBytes = await rasterPage.toPng();
         rawPages.add((
           png: pngBytes,
-          widthPt: rasterPage.width * 72 / baseDpi,
-          heightPt: rasterPage.height * 72 / baseDpi,
+          widthPt: rasterPage.width * 72 / renderDpi,
+          heightPt: rasterPage.height * 72 / renderDpi,
         ));
       }
 
-      double scaleFactor = switch (quality) {
-        CompressQuality.high => 0.70,
-        CompressQuality.normal => 0.50,
-        CompressQuality.low => 0.35,
+      int maxWidth = switch (quality) {
+        CompressQuality.high => 1100,
+        CompressQuality.normal => 820,
+        CompressQuality.low => 600,
+      };
+
+      int jpegQuality = switch (quality) {
+        CompressQuality.high => 82,
+        CompressQuality.normal => 65,
+        CompressQuality.low => 45,
       };
 
       Uint8List bestBytes = originalBytes;
       for (int attempt = 0; attempt < 6; attempt++) {
         final outPdf = pw.Document();
         for (final p in rawPages) {
-          final targetW = (p.widthPt * scaleFactor).round().clamp(180, 1200);
-          final scaledPng = await _downscalePng(p.png, targetW);
-          final img = pw.MemoryImage(scaledPng);
+          final jpgBytes = _encodeSharpJpeg(
+            p.png,
+            maxWidth: maxWidth,
+            jpegQuality: jpegQuality,
+          );
+          final img = pw.MemoryImage(jpgBytes);
           outPdf.addPage(
             pw.Page(
               pageFormat: pw_pdf.PdfPageFormat(p.widthPt, p.heightPt, marginAll: 0),
@@ -626,10 +644,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
         final candidate = await outPdf.save();
         bestBytes = candidate;
-        if (candidate.length <= targetBytes || scaleFactor <= 0.18) {
+        if (candidate.length <= targetBytes) {
           break;
         }
-        scaleFactor *= 0.72;
+        // First lower JPEG quality slightly so text remains crisp, then width
+        if (jpegQuality > 42) {
+          jpegQuality = (jpegQuality - 12).clamp(38, 85);
+        } else if (maxWidth > 420) {
+          maxWidth = (maxWidth * 0.80).round();
+        } else {
+          break;
+        }
       }
 
       final outFile = await _saveOutputFile(
