@@ -316,7 +316,7 @@ class _HomeScreenState extends State<HomeScreen> {
         ..addFile(ArchiveFile('_rels/.rels', relsXml.length, relsXml.codeUnits))
         ..addFile(ArchiveFile('word/document.xml', documentXml.length, documentXml.codeUnits));
 
-      final zipBytes = ZipEncoder().encode(archive);
+      final zipBytes = ZipEncoder().encode(archive) ?? <int>[];
       final out = await _saveOutputFile(
         Uint8List.fromList(zipBytes),
         'converted_${DateTime.now().millisecondsSinceEpoch}.docx',
