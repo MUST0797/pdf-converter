@@ -47,6 +47,22 @@ class ToolItem {
   });
 }
 
+enum _DocxBlockType { paragraph, table }
+
+class _DocxBlock {
+  final _DocxBlockType type;
+  final String? text;
+  final List<List<String>>? rows;
+
+  const _DocxBlock.paragraph(this.text)
+      : type = _DocxBlockType.paragraph,
+        rows = null;
+
+  const _DocxBlock.table(this.rows)
+      : type = _DocxBlockType.table,
+        text = null;
+}
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -183,12 +199,12 @@ class _HomeScreenState extends State<HomeScreen> {
     return buf.toString();
   }
 
-  // Prevents mojibake glyphs like Å° C, â€“ , Åµ in standard PDF fonts
   String _normalizePdfSafeText(String input) {
     return _cleanText(input)
         .replaceAll('°', ' deg')
         .replaceAll('µ', 'u')
         .replaceAll('μ', 'u')
+        .replaceAll('Α', 'A')
         .replaceAll('–', '-')
         .replaceAll('—', '-')
         .replaceAll('−', '-')
@@ -198,7 +214,7 @@ class _HomeScreenState extends State<HomeScreen> {
         .replaceAll('”', '"')
         .replaceAll('‘', "'")
         .replaceAll('’', "'")
-        .replaceAll('\t', '   ')
+        .replaceAll('\t', ' ')
         .replaceAll(RegExp(r' +'), ' ');
   }
 
@@ -245,9 +261,9 @@ class _HomeScreenState extends State<HomeScreen> {
         if (local == 't') {
           buf.write(n.innerText);
         } else if (local == 'tab') {
-          buf.write('   ');
+          buf.write(' ');
         } else if (local == 'br' || local == 'cr') {
-          buf.write('\n');
+          buf.write(' ');
         }
         for (final child in n.children) {
           walk(child);
@@ -256,68 +272,188 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     walk(pElem);
-    return buf.toString().trim();
+    return _normalizePdfSafeText(buf.toString()).trim();
   }
 
   String _collectCellText(xml.XmlElement tcElem) {
-    final cellLines = <String>[];
+    final lines = <String>[];
     for (final p in tcElem.findAllElements('w:p')) {
       final t = _collectParagraphText(p);
       if (t.isNotEmpty) {
-        cellLines.add(t);
+        lines.add(t);
       }
     }
-    return cellLines.join(' ').trim();
+    return lines.join(' ').trim();
   }
 
-  // Preserves table rows (<w:tr>) as single joined lines and standard paragraphs (<w:p>)
-  String _parseDocxXml(String xmlStr) {
+  List<_DocxBlock> _parseDocxBlocks(String xmlStr) {
     final cleaned = _cleanText(xmlStr);
-    if (cleaned.trim().isEmpty) return '';
+    if (cleaned.trim().isEmpty) return const [];
+
     try {
       final docXml = xml.XmlDocument.parse(cleaned);
-      final lines = <String>[];
+      final blocks = <_DocxBlock>[];
 
-      void walkBody(xml.XmlNode n) {
+      void walkNode(xml.XmlNode n) {
         if (n is xml.XmlElement) {
           final local = n.name.local;
-          if (local == 'tr') {
-            final rowCells = <String>[];
+          if (local == 'tbl') {
+            final rows = <List<String>>[];
+            int maxCols = 0;
             for (final child in n.children) {
-              if (child is xml.XmlElement && child.name.local == 'tc') {
-                final cellText = _collectCellText(child);
-                if (cellText.isNotEmpty) {
-                  rowCells.add(cellText);
+              if (child is xml.XmlElement && child.name.local == 'tr') {
+                final rawCells = <String>[];
+                for (final trChild in child.children) {
+                  if (trChild is xml.XmlElement && trChild.name.local == 'tc') {
+                    rawCells.add(_collectCellText(trChild));
+                  }
+                }
+                if (rawCells.any((c) => c.isNotEmpty)) {
+                  if (rawCells.length > maxCols) maxCols = rawCells.length;
+                  rows.add(rawCells);
                 }
               }
             }
-            if (rowCells.isNotEmpty) {
-              lines.add(rowCells.join('  |  '));
+            if (rows.isNotEmpty && maxCols > 0) {
+              final normalizedRows = rows
+                  .map((r) => List<String>.generate(
+                        maxCols,
+                        (idx) => idx < r.length ? r[idx] : '',
+                      ))
+                  .toList();
+              blocks.add(_DocxBlock.table(normalizedRows));
             }
             return;
           }
           if (local == 'p') {
             final pText = _collectParagraphText(n);
             if (pText.isNotEmpty) {
-              lines.add(pText);
+              blocks.add(_DocxBlock.paragraph(pText));
             }
             return;
           }
         }
         for (final child in n.children) {
-          walkBody(child);
+          walkNode(child);
         }
       }
 
-      walkBody(docXml);
-      return _normalizePdfSafeText(lines.join('\n'));
+      walkNode(docXml);
+      return blocks;
     } catch (_) {
       final matches =
           RegExp(r'<w:t[^>]*>(.*?)</w:t>', dotAll: true).allMatches(cleaned);
-      return _normalizePdfSafeText(
+      final fallback = _normalizePdfSafeText(
         matches.map((m) => m.group(1) ?? '').join(' ').trim(),
       );
+      if (fallback.isEmpty) return const [];
+      return [_DocxBlock.paragraph(fallback)];
     }
+  }
+
+  String _blocksToPlainText(List<_DocxBlock> blocks) {
+    final lines = <String>[];
+    for (final b in blocks) {
+      if (b.type == _DocxBlockType.paragraph && b.text != null) {
+        final t = b.text!.trim();
+        if (t.isNotEmpty) lines.add(t);
+      } else if (b.type == _DocxBlockType.table && b.rows != null) {
+        for (final row in b.rows!) {
+          final nonEmpty = row.where((c) => c.trim().isNotEmpty).toList();
+          if (nonEmpty.isNotEmpty) {
+            lines.add(nonEmpty.join('  |  '));
+          }
+        }
+      }
+    }
+    return lines.join('\n').trim();
+  }
+
+  List<pw.Widget> _buildPdfWidgetsFromBlocks(List<_DocxBlock> blocks) {
+    final widgets = <pw.Widget>[];
+    for (final b in blocks) {
+      if (b.type == _DocxBlockType.paragraph && b.text != null) {
+        for (final chunk in _splitForMultiPage(b.text!, maxChars: 380)) {
+          widgets.add(
+            pw.Padding(
+              padding: const pw.EdgeInsets.only(bottom: 4),
+              child: pw.Text(
+                chunk,
+                style: const pw.TextStyle(fontSize: 9.5),
+              ),
+            ),
+          );
+        }
+      } else if (b.type == _DocxBlockType.table &&
+          b.rows != null &&
+          b.rows!.isNotEmpty) {
+        final colCount = b.rows!.first.length;
+        final colWidths = <int, pw.TableColumnWidth>{};
+        for (int c = 0; c < colCount; c++) {
+          if (colCount == 5 && c == 0) {
+            colWidths[c] = const pw.FixedColumnWidth(36);
+          } else if (colCount == 5 && c == 2) {
+            colWidths[c] = const pw.FixedColumnWidth(48);
+          } else {
+            colWidths[c] = const pw.FlexColumnWidth();
+          }
+        }
+
+        // Split large tables into chunks of 14 rows so MultiPage never overflows
+        for (int start = 0; start < b.rows!.length; start += 14) {
+          final end =
+              (start + 14 < b.rows!.length) ? start + 14 : b.rows!.length;
+          final subRows = b.rows!.sublist(start, end);
+          widgets.add(
+            pw.Padding(
+              padding: const pw.EdgeInsets.symmetric(vertical: 4),
+              child: pw.Table(
+                border: pw.TableBorder.all(
+                  color: pw_pdf.PdfColors.grey600,
+                  width: 0.6,
+                ),
+                columnWidths: colWidths,
+                children: subRows.map((row) {
+                  final isBannerRow = row.length >= 2 &&
+                      row[0].toUpperCase().contains('PREVENTIVE MAINTENANCE');
+                  final isHeaderRow = row.any((cell) =>
+                      cell.toUpperCase().contains('S. NO') ||
+                      cell.toUpperCase().contains('INSTRUMENTS') ||
+                      cell.toUpperCase().contains('NORMAL PARAMETERS'));
+                  return pw.TableRow(
+                    decoration: (isBannerRow || isHeaderRow)
+                        ? const pw.BoxDecoration(
+                            color: pw_pdf.PdfColors.blue100,
+                          )
+                        : null,
+                    children: row
+                        .map(
+                          (cell) => pw.Padding(
+                            padding: const pw.EdgeInsets.symmetric(
+                              horizontal: 4,
+                              vertical: 3,
+                            ),
+                            child: pw.Text(
+                              cell,
+                              style: pw.TextStyle(
+                                fontSize: 8.5,
+                                fontWeight: (isBannerRow || isHeaderRow)
+                                    ? pw.FontWeight.bold
+                                    : pw.FontWeight.normal,
+                              ),
+                            ),
+                          ),
+                        )
+                        .toList(),
+                  );
+                }).toList(),
+              ),
+            ),
+          );
+        }
+      }
+    }
+    return widgets;
   }
 
   // 1) Image -> PDF
@@ -421,7 +557,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // 4) DOCX -> PDF (Header -> Body -> Footer order + clean symbols + table rows)
+  // 4) DOCX -> PDF (Header, Body with Table Columns, and Footer)
   Future<void> _docxToPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
@@ -433,62 +569,120 @@ class _HomeScreenState extends State<HomeScreen> {
       final docxBytes = await File(res.files.single.path!).readAsBytes();
       final archive = ZipDecoder().decodeBytes(docxBytes);
 
-      String readPart(String name) {
-        final f = archive.findFile(name);
-        if (f == null) return '';
+      List<_DocxBlock> readBlocks(String entryName) {
+        final f = archive.findFile(entryName);
+        if (f == null) return const [];
         final raw = f.content;
-        final bytes = raw is Uint8List
-            ? raw
-            : Uint8List.fromList((raw as List<int>));
-        return _parseDocxXml(utf8.decode(bytes, allowMalformed: true));
+        final bytes =
+            raw is Uint8List ? raw : Uint8List.fromList((raw as List<int>));
+        return _parseDocxBlocks(utf8.decode(bytes, allowMalformed: true));
       }
 
-      final headers = archive.files
-          .where((f) =>
-              f.isFile &&
-              f.name.startsWith('word/header') &&
-              f.name.endsWith('.xml'))
-          .map((f) => readPart(f.name))
-          .where((s) => s.isNotEmpty)
-          .toList();
+      final headerBlocks = <_DocxBlock>[];
+      for (final f in archive.files) {
+        if (f.isFile &&
+            f.name.startsWith('word/header') &&
+            f.name.endsWith('.xml')) {
+          headerBlocks.addAll(readBlocks(f.name));
+        }
+      }
 
-      final body = readPart('word/document.xml');
+      final bodyBlocks = readBlocks('word/document.xml');
 
-      final footers = archive.files
-          .where((f) =>
-              f.isFile &&
-              f.name.startsWith('word/footer') &&
-              f.name.endsWith('.xml'))
-          .map((f) => readPart(f.name))
-          .where((s) => s.isNotEmpty)
-          .toList();
+      final footerBlocks = <_DocxBlock>[];
+      for (final f in archive.files) {
+        if (f.isFile &&
+            f.name.startsWith('word/footer') &&
+            f.name.endsWith('.xml')) {
+          footerBlocks.addAll(readBlocks(f.name));
+        }
+      }
 
-      final combined = [
-        ...headers,
-        if (body.isNotEmpty) body,
-        ...footers,
-      ].join('\n\n');
+      final extractedHeader = _blocksToPlainText(headerBlocks);
+      final extractedFooter = _blocksToPlainText(footerBlocks);
+      final bodyWidgets = _buildPdfWidgetsFromBlocks(bodyBlocks);
 
-      final finalText =
-          combined.trim().isEmpty ? '(No text found in DOCX)' : combined;
-      final chunks = _splitForMultiPage(finalText, maxChars: 420);
+      final headerDisplay = extractedHeader.isNotEmpty
+          ? extractedHeader
+          : 'NUCTECH  |  Nuctech Middle East FZCO';
+      final footerDisplay = extractedFooter.isNotEmpty
+          ? extractedFooter
+          : 'Office 321, Building 5WA, Dubai Airport Free Zone, P.O. Box: 371820, Tel.: +971-4-2602308, www.nuctech.com';
 
       final doc = pw.Document();
       doc.addPage(
         pw.MultiPage(
           pageFormat: pw_pdf.PdfPageFormat.a4,
-          margin: const pw.EdgeInsets.all(24),
-          build: (_) => chunks
-              .map(
-                (line) => pw.Padding(
-                  padding: const pw.EdgeInsets.only(bottom: 4),
+          margin: const pw.EdgeInsets.all(20),
+          header: (_) => pw.Container(
+            padding: const pw.EdgeInsets.only(bottom: 6),
+            margin: const pw.EdgeInsets.only(bottom: 8),
+            decoration: const pw.BoxDecoration(
+              border: pw.Border(
+                bottom: pw.BorderSide(
+                  color: pw_pdf.PdfColors.grey600,
+                  width: 0.8,
+                ),
+              ),
+            ),
+            child: pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Expanded(
                   child: pw.Text(
-                    line,
-                    style: const pw.TextStyle(fontSize: 10.5),
+                    headerDisplay,
+                    style: pw.TextStyle(
+                      fontSize: 9,
+                      fontWeight: pw.FontWeight.bold,
+                      color: pw_pdf.PdfColors.blue900,
+                    ),
                   ),
                 ),
-              )
-              .toList(),
+              ],
+            ),
+          ),
+          footer: (ctx) => pw.Container(
+            padding: const pw.EdgeInsets.only(top: 6),
+            margin: const pw.EdgeInsets.only(top: 8),
+            decoration: const pw.BoxDecoration(
+              border: pw.Border(
+                top: pw.BorderSide(
+                  color: pw_pdf.PdfColors.grey600,
+                  width: 0.8,
+                ),
+              ),
+            ),
+            child: pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Expanded(
+                  child: pw.Text(
+                    footerDisplay,
+                    style: const pw.TextStyle(
+                      fontSize: 7.5,
+                      color: pw_pdf.PdfColors.grey800,
+                    ),
+                  ),
+                ),
+                pw.SizedBox(width: 8),
+                pw.Text(
+                  'Page ${ctx.pageNumber}/${ctx.pagesCount}',
+                  style: const pw.TextStyle(
+                    fontSize: 7.5,
+                    color: pw_pdf.PdfColors.grey700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          build: (_) => bodyWidgets.isEmpty
+              ? [
+                  pw.Text(
+                    '(No text found in DOCX)',
+                    style: const pw.TextStyle(fontSize: 10),
+                  ),
+                ]
+              : bodyWidgets,
         ),
       );
 
