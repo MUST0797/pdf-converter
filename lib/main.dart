@@ -1,32 +1,35 @@
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:pdf/pdf.dart';
+import 'package:pdf/pdf.dart' as pw_pdf;
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
-import 'package:share_plus/share_plus.dart';
+import 'package:syncfusion_flutter_pdf/pdf.dart' as sf;
+import 'package:xml/xml.dart' as xml;
 
-import 'office_tools.dart';
-import 'pdf_to_docx.dart';
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const PdfConverterApp());
+}
 
-void main() => runApp(const PdfApp());
+enum CompressQuality { high, normal, low }
 
-class PdfApp extends StatelessWidget {
-  const PdfApp({super.key});
+class PdfConverterApp extends StatelessWidget {
+  const PdfConverterApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PDF Converter',
+      title: 'PDF Converter Team',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorSchemeSeed: Colors.red,
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1565C0)),
         useMaterial3: true,
       ),
       home: const HomeScreen(),
@@ -34,985 +37,679 @@ class PdfApp extends StatelessWidget {
   }
 }
 
-// ---------- Enums & Helpers ----------
+class ToolItem {
+  final String title;
+  final IconData icon;
+  final Future<void> Function(BuildContext context) onTap;
 
-enum ImageFormatChoice { png, jpeg, jpg }
-
-enum QualityChoice { normal, high }
-
-extension ImageFormatChoiceExt on ImageFormatChoice {
-  String get label {
-    switch (this) {
-      case ImageFormatChoice.png:
-        return 'PNG';
-      case ImageFormatChoice.jpeg:
-        return 'JPEG';
-      case ImageFormatChoice.jpg:
-        return 'JPG';
-    }
-  }
-
-  String get ext {
-    switch (this) {
-      case ImageFormatChoice.png:
-        return 'png';
-      case ImageFormatChoice.jpeg:
-        return 'jpeg';
-      case ImageFormatChoice.jpg:
-        return 'jpg';
-    }
-  }
+  const ToolItem({
+    required this.title,
+    required this.icon,
+    required this.onTap,
+  });
 }
 
-extension QualityChoiceExt on QualityChoice {
-  String get label =>
-      this == QualityChoice.high ? 'High Quality' : 'Normal Quality';
-
-  String get subtitle => this == QualityChoice.high
-      ? '300 DPI • Sharp & clear (larger size)'
-      : '150 DPI • Fast & balanced size';
-
-  double get dpi => this == QualityChoice.high ? 300.0 : 150.0;
-}
-
-Future<Directory> pdfDir() async {
-  final base = await getApplicationDocumentsDirectory();
-  final dir = Directory('${base.path}/PDFs');
-  if (!await dir.exists()) await dir.create(recursive: true);
-  return dir;
-}
-
-Future<Uint8List> toPngBytes(Uint8List bytes) async {
-  final image = await decodeImageFromList(bytes);
-  final data = await image.toByteData(format: ui.ImageByteFormat.png);
-  image.dispose();
-  return data!.buffer.asUint8List();
-}
-
-Future<File> imagesToPdf(List<String> paths) async {
-  final doc = pw.Document();
-  for (final p in paths) {
-    var bytes = await File(p).readAsBytes();
-    final ext = p.toLowerCase().split('.').last;
-    if (ext != 'jpg' && ext != 'jpeg' && ext != 'png') {
-      bytes = await toPngBytes(bytes);
-    }
-    final img = pw.MemoryImage(bytes);
-    doc.addPage(
-      pw.Page(
-        pageFormat: PdfPageFormat.a4,
-        margin: const pw.EdgeInsets.all(16),
-        build: (_) => pw.Center(
-          child: pw.Image(img, fit: pw.BoxFit.contain),
-        ),
-      ),
-    );
-  }
-  final dir = await pdfDir();
-  final file =
-      File('${dir.path}/Images_${DateTime.now().millisecondsSinceEpoch}.pdf');
-  await file.writeAsBytes(await doc.save());
-  return file;
-}
-
-Future<File> textToPdf(String text, String baseName) async {
-  final doc = pw.Document();
-  final lines = text.replaceAll('\r\n', '\n').split('\n');
-  doc.addPage(
-    pw.MultiPage(
-      pageFormat: PdfPageFormat.a4,
-      margin: const pw.EdgeInsets.all(32),
-      maxPages: 2000,
-      build: (_) => lines
-          .map((l) => pw.Text(l.isEmpty ? ' ' : l,
-              style: const pw.TextStyle(fontSize: 12)))
-          .toList(),
-    ),
-  );
-  final dir = await pdfDir();
-  final file = File(
-      '${dir.path}/${baseName}_${DateTime.now().millisecondsSinceEpoch}.pdf');
-  await file.writeAsBytes(await doc.save());
-  return file;
-}
-
-Future<List<File>> pdfToImages(
-  String pdfPath, {
-  required ImageFormatChoice format,
-  required QualityChoice quality,
-  void Function(int pageCount)? onPageConverted,
-}) async {
-  final pdfBytes = await File(pdfPath).readAsBytes();
-  final dir = await pdfDir();
-  final safeBase = pdfPath
-      .split('/')
-      .last
-      .split('\\')
-      .last
-      .replaceAll(RegExp(r'\.pdf$', caseSensitive: false), '')
-      .replaceAll(RegExp(r'[^\w\-]+'), '_');
-  final stamp = DateTime.now().millisecondsSinceEpoch;
-
-  final List<File> saved = [];
-  int index = 0;
-
-  await for (final page in Printing.raster(pdfBytes, dpi: quality.dpi)) {
-    index++;
-    final Uint8List pngBytes = await page.toPng();
-    final ui.Image rawImg = await decodeImageFromList(pngBytes);
-
-    final int w = rawImg.width;
-    final int h = rawImg.height;
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(
-      recorder,
-      Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
-    );
-
-    canvas.drawRect(
-      Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
-      Paint()..color = Colors.white,
-    );
-    canvas.drawImage(rawImg, Offset.zero, Paint());
-
-    final ui.Image whiteBgImg = await recorder.endRecording().toImage(w, h);
-    final byteData =
-        await whiteBgImg.toByteData(format: ui.ImageByteFormat.png);
-
-    rawImg.dispose();
-    whiteBgImg.dispose();
-
-    if (byteData != null) {
-      final outFile = File(
-          '${dir.path}/${safeBase}_${stamp}_p$index.${format.ext}');
-      await outFile.writeAsBytes(byteData.buffer.asUint8List(), flush: true);
-      saved.add(outFile);
-      onPageConverted?.call(index);
-    }
-  }
-
-  return saved;
-}
-
-void snack(BuildContext c, String msg) {
-  ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(msg)));
-}
-
-// ---------- Home ----------
-
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    final items = <_Tool>[
-      _Tool('Image → PDF', Icons.image, true,
-          () => _go(context, const ImageToPdfScreen())),
-      _Tool('PDF → Image', Icons.collections, true,
-          () => _go(context, const PdfToImageScreen())),
-      _Tool('TXT → PDF', Icons.text_snippet, true,
-          () => _go(context, const TxtToPdfScreen())),
-      _Tool(
-          'DOCX → PDF',
-          Icons.description,
-          true,
-          () => _go(
-              context,
-              SinglePickScreen(
-                  title: 'DOCX → PDF',
-                  extension: 'docx',
-                  icon: Icons.description,
-                  onConvert: docxToPdf))),
-      _Tool(
-          'PDF → DOCX',
-          Icons.picture_as_pdf,
-          true,
-          () => _go(
-              context,
-              SinglePickScreen(
-                  title: 'PDF → DOCX',
-                  extension: 'pdf',
-                  icon: Icons.picture_as_pdf,
-                  onConvert: pdfToDocx))),
-    ];
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('PDF Converter'),
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  bool _busy = false;
+  String _statusText = '';
+
+  Future<void> _runTask(
+    BuildContext context,
+    String status,
+    Future<void> Function() task,
+  ) async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _statusText = status;
+    });
+    try {
+      await task();
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _statusText = '';
+        });
+      }
+    }
+  }
+
+  Future<File> _saveOutputFile(Uint8List bytes, String fileName) async {
+    Directory? baseDir;
+    if (Platform.isAndroid) {
+      baseDir = await getExternalStorageDirectory() ??
+          await getApplicationDocumentsDirectory();
+    } else {
+      baseDir = await getApplicationDocumentsDirectory();
+    }
+    final outDir = Directory('${baseDir.path}/PDFConverterTeam');
+    if (!await outDir.exists()) {
+      await outDir.create(recursive: true);
+    }
+    final file = File('${outDir.path}/$fileName');
+    await file.writeAsBytes(bytes, flush: true);
+    return file;
+  }
+
+  Future<void> _showResultDialog(
+    BuildContext context,
+    String title,
+    File file, {
+    String? extraInfo,
+  }) async {
+    if (!context.mounted) return;
+    final sizeKb = (await file.length() / 1024).toStringAsFixed(1);
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(
+          'Saved: ${file.path.split('/').last}\n'
+          'Size: $sizeKb KB'
+          '${extraInfo != null ? '\n$extraInfo' : ''}',
+        ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.folder),
-            tooltip: 'My Files',
-            onPressed: () => _go(context, const MyFilesScreen()),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await OpenFilex.open(file.path);
+            },
+            child: const Text('Open'),
           ),
         ],
       ),
-      body: GridView.count(
-        padding: const EdgeInsets.all(16),
-        crossAxisCount: 2,
-        mainAxisSpacing: 16,
-        crossAxisSpacing: 16,
-        children: items.map((t) => _ToolCard(t)).toList(),
-      ),
     );
   }
 
-  void _go(BuildContext c, Widget w) =>
-      Navigator.push(c, MaterialPageRoute(builder: (_) => w));
-}
-
-class _Tool {
-  final String title;
-  final IconData icon;
-  final bool ready;
-  final VoidCallback? onTap;
-  _Tool(this.title, this.icon, this.ready, this.onTap);
-}
-
-class _ToolCard extends StatelessWidget {
-  final _Tool tool;
-  const _ToolCard(this.tool);
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      color: tool.ready ? cs.primaryContainer : cs.surfaceContainerHighest,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: tool.ready ? tool.onTap : () => snack(context, 'Coming soon'),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(tool.icon, size: 48),
-            const SizedBox(height: 12),
-            Text(tool.title,
-                style: const TextStyle(fontWeight: FontWeight.w600)),
-            if (!tool.ready)
-              const Padding(
-                padding: EdgeInsets.only(top: 4),
-                child: Text('Coming soon', style: TextStyle(fontSize: 12)),
-              ),
-          ],
-        ),
-      ),
+  // 1) Image -> PDF
+  Future<void> _imageToPdf(BuildContext context) async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      allowMultiple: true,
     );
+    if (res == null || res.files.isEmpty) return;
+
+    await _runTask(context, 'Creating PDF from images...', () async {
+      final doc = pw.Document();
+      for (final pf in res.files) {
+        if (pf.path == null) continue;
+        final imgBytes = await File(pf.path!).readAsBytes();
+        final decodedImg = pw.MemoryImage(imgBytes);
+        doc.addPage(
+          pw.Page(
+            pageFormat: pw_pdf.PdfPageFormat.a4,
+            build: (_) => pw.Center(
+              child: pw.Image(decodedImg, fit: pw.BoxFit.contain),
+            ),
+          ),
+        );
+      }
+      final bytes = await doc.save();
+      final out = await _saveOutputFile(
+        bytes,
+        'images_${DateTime.now().millisecondsSinceEpoch}.pdf',
+      );
+      await _showResultDialog(context, 'Image → PDF Done', out);
+    });
   }
-}
 
-// ---------- PDF -> Image ----------
-
-class PdfToImageScreen extends StatefulWidget {
-  const PdfToImageScreen({super.key});
-
-  @override
-  State<PdfToImageScreen> createState() => _PdfToImageScreenState();
-}
-
-class _PdfToImageScreenState extends State<PdfToImageScreen> {
-  String? _pdfPath;
-  String? _pdfName;
-  ImageFormatChoice _format = ImageFormatChoice.png;
-  QualityChoice _quality = QualityChoice.normal;
-  bool _busy = false;
-  int _convertedPages = 0;
-
-  Future<void> _pickPdf() async {
+  // 2) PDF -> Image
+  Future<void> _pdfToImage(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['pdf'],
     );
     if (res == null || res.files.single.path == null) return;
-    setState(() {
-      _pdfPath = res.files.single.path!;
-      _pdfName = res.files.single.name;
-    });
-  }
 
-  Future<void> _openOptionsAndConvert() async {
-    if (_pdfPath == null || _busy) return;
-
-    final selected =
-        await showModalBottomSheet<(ImageFormatChoice, QualityChoice)>(
-      context: context,
-      showDragHandle: true,
-      builder: (ctx) {
-        var tempFormat = _format;
-        var tempQuality = _quality;
-        return StatefulBuilder(
-          builder: (ctx, setModalState) {
-            return Padding(
-              padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Image Format & Quality',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 14),
-                  const Text('Format select pannunga:',
-                      style: TextStyle(fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 8),
-                  SegmentedButton<ImageFormatChoice>(
-                    segments: ImageFormatChoice.values
-                        .map((f) => ButtonSegment<ImageFormatChoice>(
-                              value: f,
-                              label: Text(f.label),
-                            ))
-                        .toList(),
-                    selected: {tempFormat},
-                    onSelectionChanged: (set) {
-                      setModalState(() => tempFormat = set.first);
-                    },
-                  ),
-                  const SizedBox(height: 18),
-                  const Text('Quality select pannunga:',
-                      style: TextStyle(fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 8),
-                  ...QualityChoice.values.map(
-                    (q) => RadioListTile<QualityChoice>(
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(q.label),
-                      subtitle: Text(q.subtitle),
-                      value: q,
-                      groupValue: tempQuality,
-                      onChanged: (val) {
-                        if (val != null) {
-                          setModalState(() => tempQuality = val);
-                        }
-                      },
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      onPressed: () =>
-                          Navigator.pop(ctx, (tempFormat, tempQuality)),
-                      icon: const Icon(Icons.image),
-                      label: const Text('Start Convert'),
-                    ),
-                  ),
-                ],
-              ),
-            );
-          },
+    await _runTask(context, 'Exporting PDF pages as images...', () async {
+      final bytes = await File(res.files.single.path!).readAsBytes();
+      int count = 0;
+      File? lastFile;
+      await for (final page in Printing.raster(bytes, dpi: 150)) {
+        count++;
+        final pngBytes = await page.toPng();
+        lastFile = await _saveOutputFile(
+          pngBytes,
+          'page_${count}_${DateTime.now().millisecondsSinceEpoch}.png',
         );
-      },
-    );
-
-    if (selected == null) return;
-
-    setState(() {
-      _format = selected.$1;
-      _quality = selected.$2;
-      _busy = true;
-      _convertedPages = 0;
-    });
-
-    try {
-      final files = await pdfToImages(
-        _pdfPath!,
-        format: _format,
-        quality: _quality,
-        onPageConverted: (count) {
-          if (mounted) setState(() => _convertedPages = count);
-        },
-      );
-      if (!mounted) return;
-      if (files.isEmpty) {
-        snack(context, 'Pages convert panna mudiyala');
-        return;
       }
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (_) => ImageResultScreen(
-            files: files,
-            formatLabel: _format.label,
-            qualityLabel: _quality.label,
-          ),
-        ),
-      );
-    } catch (e) {
-      if (mounted) snack(context, 'Convert aagala: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('PDF → Image')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _busy ? null : _pickPdf,
-        icon: const Icon(Icons.picture_as_pdf),
-        label: const Text('Select PDF'),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
-        child: Column(
-          children: [
-            Expanded(
-              child: _pdfPath == null
-                  ? const Center(child: Text('PDF file select pannunga'))
-                  : Card(
-                      child: Padding(
-                        padding: const EdgeInsets.all(20),
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const Icon(Icons.picture_as_pdf,
-                                size: 64, color: Colors.red),
-                            const SizedBox(height: 12),
-                            Text(
-                              _pdfName ?? '',
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.w600, fontSize: 16),
-                            ),
-                            const SizedBox(height: 16),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              alignment: WrapAlignment.center,
-                              children: [
-                                Chip(label: Text('Format: ${_format.label}')),
-                                Chip(label: Text('Quality: ${_quality.label}')),
-                              ],
-                            ),
-                            if (_busy) ...[
-                              const SizedBox(height: 24),
-                              const CircularProgressIndicator(),
-                              const SizedBox(height: 10),
-                              Text(
-                                _convertedPages > 0
-                                    ? 'Converting page $_convertedPages...'
-                                    : 'Preparing pages...',
-                              ),
-                            ],
-                          ],
-                        ),
-                      ),
-                    ),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed:
-                    (_pdfPath == null || _busy) ? null : _openOptionsAndConvert,
-                icon: _busy
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.tune),
-                label: Text(_busy
-                    ? 'Converting ($_convertedPages)...'
-                    : 'Choose Format & Quality'),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ---------- Image Result ----------
-
-class ImageResultScreen extends StatelessWidget {
-  final List<File> files;
-  final String formatLabel;
-  final String qualityLabel;
-
-  const ImageResultScreen({
-    super.key,
-    required this.files,
-    required this.formatLabel,
-    required this.qualityLabel,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('Converted (${files.length})'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.share),
-            tooltip: 'Share All',
-            onPressed: () => Share.shareXFiles(
-              files.map((f) => XFile(f.path)).toList(),
-            ),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text('$formatLabel • $qualityLabel',
-                    style: const TextStyle(fontWeight: FontWeight.w600)),
-                TextButton.icon(
-                  onPressed: () => Navigator.pushReplacement(
-                    context,
-                    MaterialPageRoute(builder: (_) => const MyFilesScreen()),
-                  ),
-                  icon: const Icon(Icons.folder, size: 18),
-                  label: const Text('My Files'),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: GridView.builder(
-              padding: const EdgeInsets.all(12),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 2,
-                mainAxisSpacing: 12,
-                crossAxisSpacing: 12,
-                childAspectRatio: 0.75,
-              ),
-              itemCount: files.length,
-              itemBuilder: (_, i) {
-                final f = files[i];
-                return Card(
-                  clipBehavior: Clip.antiAlias,
-                  child: Column(
-                    children: [
-                      Expanded(
-                        child: GestureDetector(
-                          onTap: () => OpenFilex.open(f.path),
-                          child: Image.file(
-                            f,
-                            width: double.infinity,
-                            fit: BoxFit.cover,
-                          ),
-                        ),
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 4),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Text('Page ${i + 1}',
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.w600)),
-                            Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                IconButton(
-                                  icon: const Icon(Icons.open_in_new, size: 20),
-                                  onPressed: () => OpenFilex.open(f.path),
-                                ),
-                                IconButton(
-                                  icon: const Icon(Icons.share, size: 20),
-                                  onPressed: () =>
-                                      Share.shareXFiles([XFile(f.path)]),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ---------- Image -> PDF ----------
-
-class ImageToPdfScreen extends StatefulWidget {
-  const ImageToPdfScreen({super.key});
-
-  @override
-  State<ImageToPdfScreen> createState() => _ImageToPdfScreenState();
-}
-
-class _ImageToPdfScreenState extends State<ImageToPdfScreen> {
-  final List<String> _paths = [];
-  bool _busy = false;
-
-  Future<void> _pick() async {
-    final res = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif'],
-      allowMultiple: true,
-    );
-    if (res == null) return;
-    setState(() {
-      for (final f in res.files) {
-        if (f.path != null) _paths.add(f.path!);
+      if (lastFile != null && context.mounted) {
+        await _showResultDialog(
+          context,
+          'PDF → Image Done',
+          lastFile,
+          extraInfo: 'Total pages exported: $count',
+        );
       }
     });
   }
 
-  Future<void> _convert() async {
-    setState(() => _busy = true);
-    try {
-      final file = await imagesToPdf(_paths);
-      if (!mounted) return;
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => ResultScreen(file: file)),
-      );
-    } catch (e) {
-      if (mounted) snack(context, 'Convert aagala: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Image → PDF')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _busy ? null : _pick,
-        icon: const Icon(Icons.add_photo_alternate),
-        label: const Text('Add images'),
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _paths.isEmpty
-                ? const Center(child: Text('Images select pannunga'))
-                : ReorderableListView.builder(
-                    itemCount: _paths.length,
-                    onReorder: (o, n) {
-                      setState(() {
-                        if (n > o) n--;
-                        _paths.insert(n, _paths.removeAt(o));
-                      });
-                    },
-                    itemBuilder: (_, i) => ListTile(
-                      key: ValueKey('${_paths[i]}_$i'),
-                      leading: Image.file(File(_paths[i]),
-                          width: 48, height: 48, fit: BoxFit.cover),
-                      title: Text(_paths[i].split('/').last,
-                          maxLines: 1, overflow: TextOverflow.ellipsis),
-                      subtitle: Text('Page ${i + 1}'),
-                      trailing: IconButton(
-                        icon: const Icon(Icons.close),
-                        onPressed: () => setState(() => _paths.removeAt(i)),
-                      ),
-                    ),
-                  ),
-          ),
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
-              child: SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: (_paths.isEmpty || _busy) ? null : _convert,
-                  icon: _busy
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Icon(Icons.picture_as_pdf),
-                  label: Text(_busy ? 'Converting...' : 'Convert to PDF'),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ---------- TXT -> PDF ----------
-
-class TxtToPdfScreen extends StatefulWidget {
-  const TxtToPdfScreen({super.key});
-
-  @override
-  State<TxtToPdfScreen> createState() => _TxtToPdfScreenState();
-}
-
-class _TxtToPdfScreenState extends State<TxtToPdfScreen> {
-  String? _name;
-  String? _text;
-  bool _busy = false;
-
-  Future<void> _pick() async {
+  // 3) TXT -> PDF
+  Future<void> _txtToPdf(BuildContext context) async {
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['txt'],
     );
     if (res == null || res.files.single.path == null) return;
-    final path = res.files.single.path!;
-    final bytes = await File(path).readAsBytes();
-    setState(() {
-      _name = res.files.single.name;
-      _text = utf8.decode(bytes, allowMalformed: true);
+
+    await _runTask(context, 'Converting TXT to PDF...', () async {
+      final content = await File(res.files.single.path!).readAsString();
+      final doc = pw.Document();
+      doc.addPage(
+        pw.MultiPage(
+          pageFormat: pw_pdf.PdfPageFormat.a4,
+          build: (_) => [pw.Text(content, style: const pw.TextStyle(fontSize: 12))],
+        ),
+      );
+      final bytes = await doc.save();
+      final out = await _saveOutputFile(
+        bytes,
+        'text_${DateTime.now().millisecondsSinceEpoch}.pdf',
+      );
+      await _showResultDialog(context, 'TXT → PDF Done', out);
     });
   }
 
-  Future<void> _convert() async {
-    setState(() => _busy = true);
-    try {
-      final base =
-          _name!.replaceAll(RegExp(r'\.txt$', caseSensitive: false), '');
-      final file = await textToPdf(_text!, base);
-      if (!mounted) return;
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => ResultScreen(file: file)),
-      );
-    } catch (e) {
-      if (mounted) snack(context, 'Convert aagala: $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final preview = (_text ?? '');
-    return Scaffold(
-      appBar: AppBar(title: const Text('TXT → PDF')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _busy ? null : _pick,
-        icon: const Icon(Icons.text_snippet),
-        label: const Text('Select TXT file'),
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _text == null
-                ? const Center(child: Text('TXT file select pannunga'))
-                : Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(_name!,
-                            style: const TextStyle(
-                                fontWeight: FontWeight.w600, fontSize: 16)),
-                        const SizedBox(height: 4),
-                        Text('${_text!.length} characters'),
-                        const Divider(height: 24),
-                        Expanded(
-                          child: SingleChildScrollView(
-                            child: Text(
-                              preview.length > 1500
-                                  ? '${preview.substring(0, 1500)}...'
-                                  : preview,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-          ),
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
-              child: SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: (_text == null || _busy) ? null : _convert,
-                  icon: _busy
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Icon(Icons.picture_as_pdf),
-                  label: Text(_busy ? 'Converting...' : 'Convert to PDF'),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
+  // 4) DOCX -> PDF
+  Future<void> _docxToPdf(BuildContext context) async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['docx'],
     );
+    if (res == null || res.files.single.path == null) return;
+
+    await _runTask(context, 'Converting DOCX to PDF...', () async {
+      final docxBytes = await File(res.files.single.path!).readAsBytes();
+      final archive = ZipDecoder().decodeBytes(docxBytes);
+      final docXmlFile = archive.findFile('word/document.xml');
+      String extractedText = '';
+      if (docXmlFile != null) {
+        final xmlStr = String.fromCharCodes(docXmlFile.content as List<int>);
+        final documentXml = xml.XmlDocument.parse(xmlStr);
+        final paragraphs = documentXml.findAllElements('w:p');
+        extractedText = paragraphs
+            .map((p) => p.findAllElements('w:t').map((t) => t.innerText).join())
+            .where((line) => line.trim().isNotEmpty)
+            .join('\n\n');
+      }
+      final doc = pw.Document();
+      doc.addPage(
+        pw.MultiPage(
+          pageFormat: pw_pdf.PdfPageFormat.a4,
+          build: (_) => [
+            pw.Text(
+              extractedText.isEmpty ? '(No text found in DOCX)' : extractedText,
+              style: const pw.TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
+      );
+      final bytes = await doc.save();
+      final out = await _saveOutputFile(
+        bytes,
+        'docx_${DateTime.now().millisecondsSinceEpoch}.pdf',
+      );
+      await _showResultDialog(context, 'DOCX → PDF Done', out);
+    });
   }
-}
 
-// ---------- Result ----------
+  // 5) PDF -> DOCX
+  Future<void> _pdfToDocx(BuildContext context) async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+    );
+    if (res == null || res.files.single.path == null) return;
 
-class ResultScreen extends StatelessWidget {
-  final File file;
-  const ResultScreen({super.key, required this.file});
+    await _runTask(context, 'Extracting text to DOCX...', () async {
+      final pdfBytes = await File(res.files.single.path!).readAsBytes();
+      final sfDoc = sf.PdfDocument(inputBytes: pdfBytes);
+      final text = sf.PdfTextExtractor(sfDoc).extractText();
+      sfDoc.dispose();
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Done')),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
+      final escaped = text
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;');
+      final lines = escaped.split('\n');
+      final bodyXml = lines
+          .map((l) => '<w:p><w:r><w:t xml:space="preserve">$l</w:t></w:r></w:p>')
+          .join();
+
+      final documentXml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>$bodyXml</w:body>
+</w:document>''';
+
+      const contentTypesXml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>''';
+
+      const relsXml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>''';
+
+      final archive = Archive()
+        ..addFile(ArchiveFile('[Content_Types].xml', contentTypesXml.length, contentTypesXml.codeUnits))
+        ..addFile(ArchiveFile('_rels/.rels', relsXml.length, relsXml.codeUnits))
+        ..addFile(ArchiveFile('word/document.xml', documentXml.length, documentXml.codeUnits));
+
+      final zipBytes = ZipEncoder().encode(archive);
+      final out = await _saveOutputFile(
+        Uint8List.fromList(zipBytes),
+        'converted_${DateTime.now().millisecondsSinceEpoch}.docx',
+      );
+      await _showResultDialog(context, 'PDF → DOCX Done', out);
+    });
+  }
+
+  // 6) PDF Page Merger & Page Remover
+  Future<void> _pdfMergeOrRemove(BuildContext context) async {
+    final mode = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
         child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.check_circle, size: 80, color: Colors.green),
-            const SizedBox(height: 16),
-            Text(file.path.split('/').last, textAlign: TextAlign.center),
-            const SizedBox(height: 32),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: () => OpenFilex.open(file.path),
-                icon: const Icon(Icons.open_in_new),
-                label: const Text('Open'),
+            const ListTile(
+              title: Text(
+                'PDF Page Merger & Remover',
+                style: TextStyle(fontWeight: FontWeight.bold),
               ),
             ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () => Share.shareXFiles([XFile(file.path)]),
-                icon: const Icon(Icons.share),
-                label: const Text('Share'),
-              ),
+            ListTile(
+              leading: const Icon(Icons.merge_type),
+              title: const Text('Merge Multiple PDFs'),
+              subtitle: const Text('Combine 2 or more PDF files into one PDF'),
+              onTap: () => Navigator.pop(ctx, 'merge'),
             ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: TextButton.icon(
-                onPressed: () => Navigator.pushReplacement(
-                  context,
-                  MaterialPageRoute(builder: (_) => const MyFilesScreen()),
-                ),
-                icon: const Icon(Icons.folder),
-                label: const Text('My Files'),
-              ),
+            ListTile(
+              leading: const Icon(Icons.delete_sweep),
+              title: const Text('Remove Pages from PDF'),
+              subtitle: const Text('Select pages to delete and save new PDF'),
+              onTap: () => Navigator.pop(ctx, 'remove'),
             ),
           ],
         ),
       ),
     );
+
+    if (mode == null || !context.mounted) return;
+
+    if (mode == 'merge') {
+      final res = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['pdf'],
+        allowMultiple: true,
+      );
+      if (res == null || res.files.length < 2) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Select at least 2 PDF files to merge')),
+          );
+        }
+        return;
+      }
+
+      await _runTask(context, 'Merging PDF files...', () async {
+        final mergedDoc = sf.PdfDocument();
+        mergedDoc.pageSettings.margins.all = 0;
+
+        for (final pf in res.files) {
+          if (pf.path == null) continue;
+          final bytes = await File(pf.path!).readAsBytes();
+          final srcDoc = sf.PdfDocument(inputBytes: bytes);
+          for (int i = 0; i < srcDoc.pages.count; i++) {
+            final srcPage = srcDoc.pages[i];
+            final template = srcPage.createTemplate();
+            final newPage = mergedDoc.pages.add();
+            newPage.graphics.drawPdfTemplate(
+              template,
+              ui.Offset.zero,
+              ui.Size(srcPage.size.width, srcPage.size.height),
+            );
+          }
+          srcDoc.dispose();
+        }
+
+        final outBytes = Uint8List.fromList(await mergedDoc.save());
+        mergedDoc.dispose();
+
+        final outFile = await _saveOutputFile(
+          outBytes,
+          'merged_${DateTime.now().millisecondsSinceEpoch}.pdf',
+        );
+        await _showResultDialog(context, 'PDF Merged', outFile);
+      });
+    } else if (mode == 'remove') {
+      final res = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['pdf'],
+      );
+      if (res == null || res.files.single.path == null) return;
+
+      final bytes = await File(res.files.single.path!).readAsBytes();
+      final tempDoc = sf.PdfDocument(inputBytes: bytes);
+      final totalPages = tempDoc.pages.count;
+      tempDoc.dispose();
+
+      if (totalPages <= 1) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('PDF has only 1 page')),
+          );
+        }
+        return;
+      }
+
+      if (!context.mounted) return;
+      final pagesToRemove = <int>{};
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            title: Text('Select Pages to Remove ($totalPages pages)'),
+            content: SizedBox(
+              width: double.maxFinite,
+              height: 320,
+              child: ListView.builder(
+                itemCount: totalPages,
+                itemBuilder: (_, idx) {
+                  final pageNum = idx + 1;
+                  final checked = pagesToRemove.contains(idx);
+                  return CheckboxListTile(
+                    title: Text('Page $pageNum'),
+                    value: checked,
+                    onChanged: (val) {
+                      setDialogState(() {
+                        if (val == true) {
+                          if (pagesToRemove.length < totalPages - 1) {
+                            pagesToRemove.add(idx);
+                          }
+                        } else {
+                          pagesToRemove.remove(idx);
+                        }
+                      });
+                    },
+                  );
+                },
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: pagesToRemove.isEmpty
+                    ? null
+                    : () => Navigator.pop(ctx, true),
+                child: Text('Remove (${pagesToRemove.length})'),
+              ),
+            ],
+          ),
+        ),
+      );
+
+      if (confirmed != true || pagesToRemove.isEmpty || !context.mounted) return;
+
+      await _runTask(context, 'Removing selected pages...', () async {
+        final srcDoc = sf.PdfDocument(inputBytes: bytes);
+        final outDoc = sf.PdfDocument();
+        outDoc.pageSettings.margins.all = 0;
+
+        int kept = 0;
+        for (int i = 0; i < srcDoc.pages.count; i++) {
+          if (pagesToRemove.contains(i)) continue;
+          final srcPage = srcDoc.pages[i];
+          final template = srcPage.createTemplate();
+          final page = outDoc.pages.add();
+          page.graphics.drawPdfTemplate(
+            template,
+            ui.Offset.zero,
+            ui.Size(srcPage.size.width, srcPage.size.height),
+          );
+          kept++;
+        }
+        srcDoc.dispose();
+
+        final outBytes = Uint8List.fromList(await outDoc.save());
+        outDoc.dispose();
+
+        final outFile = await _saveOutputFile(
+          outBytes,
+          'trimmed_${DateTime.now().millisecondsSinceEpoch}.pdf',
+        );
+        await _showResultDialog(
+          context,
+          'Pages Removed',
+          outFile,
+          extraInfo: 'Remaining pages: $kept',
+        );
+      });
+    }
   }
-}
 
-// ---------- My Files ----------
+  // 7) PDF File Compressor (High / Normal / Low Quality)
+  Future<void> _compressPdf(BuildContext context) async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+    );
+    if (res == null || res.files.single.path == null) return;
 
-class MyFilesScreen extends StatefulWidget {
-  const MyFilesScreen({super.key});
-
-  @override
-  State<MyFilesScreen> createState() => _MyFilesScreenState();
-}
-
-class _MyFilesScreenState extends State<MyFilesScreen> {
-  List<File> _files = [];
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    final dir = await pdfDir();
-    final list = dir
-        .listSync()
-        .whereType<File>()
-        .where((f) {
-          final p = f.path.toLowerCase();
-          return p.endsWith('.pdf') ||
-              p.endsWith('.docx') ||
-              p.endsWith('.png') ||
-              p.endsWith('.jpg') ||
-              p.endsWith('.jpeg');
-        })
-        .toList()
-      ..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
-    if (!mounted) return;
-    setState(() {
-      _files = list;
-      _loading = false;
-    });
-  }
-
-  Future<void> _delete(File f) async {
-    final ok = await showDialog<bool>(
+    if (!context.mounted) return;
+    final quality = await showDialog<CompressQuality>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Delete pannattuma?'),
-        content: Text(f.path.split('/').last),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel')),
-          TextButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Delete')),
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Select Compression Quality'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, CompressQuality.high),
+            child: const ListTile(
+              leading: Icon(Icons.high_quality),
+              title: Text('High Quality'),
+              subtitle: Text('Best clarity, lighter compression'),
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, CompressQuality.normal),
+            child: const ListTile(
+              leading: Icon(Icons.tune),
+              title: Text('Normal Quality'),
+              subtitle: Text('Balanced quality & smaller file size'),
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, CompressQuality.low),
+            child: const ListTile(
+              leading: Icon(Icons.compress),
+              title: Text('Low Quality'),
+              subtitle: Text('Maximum size reduction'),
+            ),
+          ),
         ],
       ),
     );
-    if (ok == true) {
-      await f.delete();
-      _load();
-    }
+
+    if (quality == null || !context.mounted) return;
+
+    final double dpi = switch (quality) {
+      CompressQuality.high => 150,
+      CompressQuality.normal => 105,
+      CompressQuality.low => 72,
+    };
+
+    final String qualityLabel = switch (quality) {
+      CompressQuality.high => 'High Quality',
+      CompressQuality.normal => 'Normal Quality',
+      CompressQuality.low => 'Low Quality',
+    };
+
+    await _runTask(context, 'Compressing PDF ($qualityLabel)...', () async {
+      final originalFile = File(res.files.single.path!);
+      final originalBytes = await originalFile.readAsBytes();
+      final originalKb = (originalBytes.length / 1024).toStringAsFixed(1);
+
+      final outPdf = pw.Document();
+      await for (final rasterPage in Printing.raster(originalBytes, dpi: dpi)) {
+        final pngBytes = await rasterPage.toPng();
+        final img = pw.MemoryImage(pngBytes);
+        outPdf.addPage(
+          pw.Page(
+            pageFormat: pw_pdf.PdfPageFormat(
+              rasterPage.width * 72 / dpi,
+              rasterPage.height * 72 / dpi,
+              marginAll: 0,
+            ),
+            build: (_) => pw.Image(img, fit: pw.BoxFit.fill),
+          ),
+        );
+      }
+
+      final compressedBytes = await outPdf.save();
+      final outFile = await _saveOutputFile(
+        compressedBytes,
+        'compressed_${DateTime.now().millisecondsSinceEpoch}.pdf',
+      );
+
+      await _showResultDialog(
+        context,
+        'PDF Compressed ($qualityLabel)',
+        outFile,
+        extraInfo: 'Original: $originalKb KB',
+      );
+    });
   }
 
   @override
   Widget build(BuildContext context) {
+    final tools = <ToolItem>[
+      ToolItem(
+        title: 'Image → PDF',
+        icon: Icons.image,
+        onTap: _imageToPdf,
+      ),
+      ToolItem(
+        title: 'PDF → Image',
+        icon: Icons.photo_library,
+        onTap: _pdfToImage,
+      ),
+      ToolItem(
+        title: 'TXT → PDF',
+        icon: Icons.description,
+        onTap: _txtToPdf,
+      ),
+      ToolItem(
+        title: 'DOCX → PDF',
+        icon: Icons.article,
+        onTap: _docxToPdf,
+      ),
+      ToolItem(
+        title: 'PDF → DOCX',
+        icon: Icons.picture_as_pdf,
+        onTap: _pdfToDocx,
+      ),
+      ToolItem(
+        title: 'PDF Merge / Remove',
+        icon: Icons.auto_awesome_motion,
+        onTap: _pdfMergeOrRemove,
+      ),
+      ToolItem(
+        title: 'Compress PDF',
+        icon: Icons.compress,
+        onTap: _compressPdf,
+      ),
+    ];
+
     return Scaffold(
-      appBar: AppBar(title: const Text('My Files')),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _files.isEmpty
-              ? const Center(child: Text('Innum files illa'))
-              : ListView.builder(
-                  itemCount: _files.length,
-                  itemBuilder: (_, i) {
-                    final f = _files[i];
-                    final lower = f.path.toLowerCase();
-                    final isPdf = lower.endsWith('.pdf');
-                    final isImage = lower.endsWith('.png') ||
-                        lower.endsWith('.jpg') ||
-                        lower.endsWith('.jpeg');
-                    final kb = (f.lengthSync() / 1024).toStringAsFixed(0);
-                    return ListTile(
-                      leading: isImage
-                          ? Image.file(f,
-                              width: 40, height: 40, fit: BoxFit.cover)
-                          : Icon(
-                              isPdf
-                                  ? Icons.picture_as_pdf
-                                  : Icons.description,
-                              color: isPdf ? Colors.red : Colors.blue),
-                      title: Text(f.path.split('/').last,
-                          maxLines: 1, overflow: TextOverflow.ellipsis),
-                      subtitle: Text('$kb KB'),
-                      onTap: () => OpenFilex.open(f.path),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.share),
-                            onPressed: () => Share.shareXFiles([XFile(f.path)]),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.delete_outline),
-                            onPressed: () => _delete(f),
-                          ),
-                        ],
+      appBar: AppBar(
+        title: const Text('PDF Converter Team'),
+      ),
+      body: Stack(
+        children: [
+          GridView.builder(
+            padding: const EdgeInsets.all(16),
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 2,
+              crossAxisSpacing: 14,
+              mainAxisSpacing: 14,
+              childAspectRatio: 1.0,
+            ),
+            itemCount: tools.length,
+            itemBuilder: (ctx, index) {
+              final item = tools[index];
+              return InkWell(
+                borderRadius: BorderRadius.circular(16),
+                onTap: () => item.onTap(ctx),
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF6DFDC),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(item.icon, size: 42, color: Colors.black87),
+                      const SizedBox(height: 12),
+                      Text(
+                        item.title,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.black87,
+                        ),
                       ),
-                    );
-                  },
+                    ],
+                  ),
                 ),
+              );
+            },
+          ),
+          if (_busy)
+            Container(
+              color: Colors.black38,
+              child: Center(
+                child: Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const CircularProgressIndicator(),
+                        const SizedBox(height: 14),
+                        Text(_statusText),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }
